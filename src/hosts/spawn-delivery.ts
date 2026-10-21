@@ -317,7 +317,7 @@ export async function deliverViaSpawn(deps: SpawnRunnerDeps, member: Member): Pr
   const builder = spawnBuilderFor(member.host)!
   const budget = spawnArgvBudget()
   const FRAMING_PER_MSG = 450
-  const JOIN_SEP = 6 // "\n\n---\n\n".length
+  const JOIN_SEP = Buffer.byteLength("\n\n---\n\n", "utf8") // 7
 
   // Phase 1 (locked): head-only oversized refusal, else partial drain.
   let batch: Array<{ id: string; channelName: string }> = []
@@ -327,12 +327,12 @@ export async function deliverViaSpawn(deps: SpawnRunnerDeps, member: Member): Pr
     await deps.withLock(() => {
       const state = deps.load()
       const cmd = builder.buildResumeCommand({ hostSessionId: member.host_session_id as string, cwd: deps.cwd })
-      const fixedOverhead = cmd.command.length + cmd.args.join(" ").length + 64
+      const fixedOverhead = Buffer.byteLength(cmd.command, "utf8") + Buffer.byteLength(cmd.args.join(" "), "utf8") + 64
 
       for (const id of state.queues[member.session_id] ?? []) {
         const msg = state.messages[id]
         if (!msg || msg.delivery_status !== "pending") continue
-        const headCost = fixedOverhead + msg.content.length + FRAMING_PER_MSG
+        const headCost = fixedOverhead + Buffer.byteLength(msg.content, "utf8") + FRAMING_PER_MSG
         if (headCost > budget) headOversizedId = id
         break
       }
@@ -340,7 +340,7 @@ export async function deliverViaSpawn(deps: SpawnRunnerDeps, member: Member): Pr
 
       let used = fixedOverhead
       const canDeliver = (msg: { content: string }) => {
-        const cost = msg.content.length + FRAMING_PER_MSG + JOIN_SEP
+        const cost = Buffer.byteLength(msg.content, "utf8") + FRAMING_PER_MSG + JOIN_SEP
         if (used + cost > budget) return false
         used += cost
         return true

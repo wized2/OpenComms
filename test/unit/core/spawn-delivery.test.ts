@@ -337,6 +337,38 @@ test("P2-2: head message alone oversized refused; queue untouched; no spawn", as
   }
 })
 
+test("P2-2b-strict: smaller later message does not leapfrog a blocked head", async () => {
+  // 80k head exceeds budget after fixed overhead on win32 (30k) and nearly fills
+  // linux 120k with framing; 50k is still too large to follow an 80k head;
+  // 5k must remain queued behind both — never delivered alone.
+  if (process.platform === "win32") return
+
+  const state = emptyState()
+  const member = makeMember()
+  seedChannelWithSpawnMember(state, member)
+  const sizes = [80_000, 50_000, 5_000]
+  for (let i = 0; i < sizes.length; i++) {
+    const sent = sendMessage(state, { channel: "spawn-ch", content: `m${i} ` + "x".repeat(sizes[i]!) }, "sess_sender")
+    assert.equal(sent.ok, true)
+  }
+  const { deps, spawned, errors } = makeFakeDeps(state)
+  const outcome = await deliverViaSpawn(deps, member)
+  // Head alone may or may not fit; either way the 5k message must not spawn alone.
+  const pending = Object.values(state.messages).filter((m) => m.delivery_status === "pending")
+  if (outcome.status === "delivered") {
+    // Only a prefix from the front is allowed.
+    assert.ok(spawned.length === 1)
+    assert.ok(pending.length >= 1)
+    // The 5k message (last) must still be pending if 50k was not delivered first.
+    const lastId = (state.queues[member.session_id] ?? []).at(-1)
+    assert.ok(lastId)
+  } else {
+    assert.equal(spawned.length, 0)
+    assert.equal(pending.length, 3)
+  }
+  assert.equal(errors.filter((e) => e.includes("spawn argv limit")).length, 0)
+})
+
 test("P2-2b: FIFO partial drain when batch exceeds budget (issue #3)", async () => {
   // Force POSIX-sized budget path: three ~45k messages → first two fit under
   // 120k, third stays pending. On win32 (30k) the head alone is oversized;

@@ -1286,9 +1286,13 @@ export function drainQueue(
       continue
     }
 
+    // Strict FIFO under size/budget gates: once the head does not fit, stop.
+    // Do not skip a large message to deliver a later smaller one.
     if (opts.canDeliver && !opts.canDeliver(msg)) {
       remaining.push(id)
-      continue
+      const idx = queue.indexOf(id)
+      for (const rest of queue.slice(idx + 1)) remaining.push(rest)
+      break
     }
 
     msg.delivery_status = "in_flight"
