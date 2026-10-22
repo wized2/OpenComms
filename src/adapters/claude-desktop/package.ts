@@ -1,51 +1,12 @@
 ﻿/**
- * Claude Desktop adapter â€” Desktop Extension (.mcpb) packaging + install.
- *
- * Verified 2026-08-29 against official sources (see docs/CLAUDE_DESKTOP.md):
- * - .mcpb = ZIP containing manifest.json (spec v0.3) + server code
- *   (github.com/modelcontextprotocol/mcpb).
- * - Claude Desktop spawns the server per mcp_config over stdio; user_config
- *   values substitute as ${user_config.KEY}; sensitive values go to the OS
- *   keychain.
- * - Delivery is STRICTLY PULL: no conversation identity, no push, no
- *   lifecycle. The model/user must call tools for anything to happen.
- *
- * The adapter therefore:
- *   - registers PULL members (stale_policy "none": messages survive until read),
- *   - exposes only non-privileged tools by default (no kick),
- *   - never claims push/role injection/lifecycle.
+ * Desktop MCPB layout is pull-only: no native conversation identity, lifecycle
+ * or push. Non-privileged tools are exposed by default.
  */
 
-import { existsSync, mkdirSync, copyFileSync } from "node:fs"
+import { existsSync, mkdirSync, writeFileSync } from "node:fs"
 import { readFileSync } from "node:fs"
-import { execFileSync } from "node:child_process"
-import { join, resolve, dirname } from "node:path"
-import { fileURLToPath } from "node:url"
-
-const here = (() => {
-  try {
-    return dirname(fileURLToPath(import.meta.url))
-  } catch {
-    return process.cwd()
-  }
-})()
-
-/**
- * Locate the repo/package root robustly: the nearest ancestor (including
- * this module's dir) containing package.json. Works identically whether
- * this module runs from src/, dist/, or dist-test/.
- */
-function findPackageRoot(startDir: string): string {
-  let dir = startDir
-  for (;;) {
-    if (existsSync(join(dir, "package.json"))) return dir
-    const parent = dirname(dir)
-    if (parent === dir) return startDir // filesystem root; give up
-    dir = parent
-  }
-}
-
-const packageRoot = findPackageRoot(here)
+import { join, resolve } from "node:path"
+import { readAdapterResource } from "../../cli/adapter-resources.js"
 
 export interface DesktopPackageResult {
   ok: boolean
@@ -63,9 +24,13 @@ export function validateDesktopManifest(manifestPath: string): { ok: true } | { 
   if (!existsSync(manifestPath)) {
     return { ok: false, reason: `manifest not found: ${manifestPath}` }
   }
+  return validateManifestContent(readFileSync(manifestPath, "utf8"))
+}
+
+function validateManifestContent(content: string): { ok: true } | { ok: false; reason: string } {
   let parsed: unknown
   try {
-    parsed = JSON.parse(readFileSync(manifestPath, "utf8"))
+    parsed = JSON.parse(content)
   } catch (error) {
     return { ok: false, reason: `manifest JSON invalid: ${(error as Error).message}` }
   }
@@ -85,34 +50,25 @@ export function validateDesktopManifest(manifestPath: string): { ok: true } | { 
 }
 
 /**
- * Lay out the .mcpb bundle contents for the Desktop adapter:
- *   <outDir>/manifest.json
- *   <outDir>/server/main.mjs        (SELF-CONTAINED esbuild bundle — the
- *                                    un-bundled dist/mcp/main.js imports
- *                                    relative modules that don't ship)
- * Package with the official CLI: npx @anthropic-ai/mcpb pack <bundleDir>.
+ * Write manifest.json and the standalone server/main.mjs into outDir.
+ * Package with npx @anthropic-ai/mcpb pack <bundleDir>.
  */
 export function buildDesktopBundle(opts: { projectDir: string; outDir?: string }): DesktopPackageResult {
-  // Manifest lookup order: repo source (src layout), the compiled sibling
-  // copy (dist layout), and up from compiled test trees. All point at the
-  // same source-managed file; first existing wins.
-  const candidates = [
-    join(here, "manifest.json"),
-    resolve(here, "..", "..", "..", "adapters", "claude-desktop", "manifest.json"),
-    resolve(here, "..", "..", "..", "..", "adapters", "claude-desktop", "manifest.json"),
-    resolve(here, "..", "..", "..", "..", "..", "adapters", "claude-desktop", "manifest.json"),
-  ]
-  const manifestPath = candidates.find((p) => existsSync(p))
-  if (!manifestPath) {
+  let manifest: string
+  let server: string
+  try {
+    manifest = readAdapterResource("claude-desktop-manifest")
+    server = readAdapterResource("opencomms-mcp")
+  } catch (error) {
     return {
       ok: false,
       bundleDir: null,
       manifestValid: false,
-      warnings: [`manifest.json not found in any known location (tried: ${candidates.join(", ")})`],
+      warnings: [(error as Error).message],
       capabilities: DESKTOP_CAPABILITIES,
     }
   }
-  const check = validateDesktopManifest(manifestPath)
+  const check = validateManifestContent(manifest)
   if (!check.ok) {
     return {
       ok: false,
@@ -125,42 +81,13 @@ export function buildDesktopBundle(opts: { projectDir: string; outDir?: string }
 
   const bundleDir = resolve(opts.outDir ?? join(opts.projectDir, "opencomms-claude-desktop"))
   mkdirSync(bundleDir, { recursive: true })
-  copyFileSync(manifestPath, join(bundleDir, "manifest.json"))
+  writeFileSync(join(bundleDir, "manifest.json"), manifest, "utf8")
 
-  // The MCP server must be SELF-CONTAINED: the plain dist output imports
-  // relative modules (../core/*) that a .mcpb zip does not carry. Produce a
-  // single-file esbuild bundle at packaging time (no extra deps; esbuild is
-  // already a devDependency).
+  // The published/embedded bundle is already self-contained. Installation
+  // requires neither a source checkout nor build-time dependencies.
   const serverDir = join(bundleDir, "server")
   mkdirSync(serverDir, { recursive: true })
-  let bundled = false
-  try {
-    const bundleScript = join(packageRoot, "scripts", "bundle.mjs")
-    const mainSource = join(packageRoot, "src", "mcp", "main.ts")
-    execFileSync(
-      process.execPath,
-      [bundleScript, "--entry", mainSource, "--format", "esm", "--outfile", join(serverDir, "main.mjs")],
-      { stdio: "pipe", timeout: 120_000, cwd: packageRoot },
-    )
-    bundled = existsSync(join(serverDir, "main.mjs"))
-  } catch (error) {
-    return {
-      ok: false,
-      manifestValid: true,
-      bundleDir,
-      warnings: [`Failed to produce the self-contained server bundle: ${(error as Error).message}`],
-      capabilities: DESKTOP_CAPABILITIES,
-    }
-  }
-  if (!bundled) {
-    return {
-      ok: false,
-      manifestValid: true,
-      bundleDir,
-      warnings: ["Server bundle missing after esbuild run — check esbuild availability."],
-      capabilities: DESKTOP_CAPABILITIES,
-    }
-  }
+  writeFileSync(join(serverDir, "main.mjs"), server, "utf8")
 
   return {
     ok: true,
@@ -173,7 +100,6 @@ export function buildDesktopBundle(opts: { projectDir: string; outDir?: string }
   }
 }
 
-/** Honest capability report for the Desktop adapter (no fake push). */
 export const DESKTOP_CAPABILITIES: Record<string, string> = {
   installation: "PARTIAL (.mcpb bundle; install via Claude Desktop > Settings > Extensions)",
   delivery: "PULL ONLY (model/user invokes opencomms_inbox; no push into conversations)",

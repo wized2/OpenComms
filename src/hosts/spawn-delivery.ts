@@ -1,35 +1,19 @@
 ﻿/**
- * Spawn-push delivery â€” real PUSH for hosts whose CLI can resume a session
- * non-interactively (verified against official docs, 2026-09-08):
- *
- *   Claude Code:  claude --resume <session-id> --print "<message>"
- *   Codex CLI:    codex exec resume <session-id> "<message>"
- *
- * This is a DOCUMENTED API, not terminal keystroke automation. The message
- * is passed as a single argv element via execFile-style spawn (no shell),
- * so untrusted peer content can never inject shell syntax. Delivery runs
- * the same two-phase protocol as push: drain marks in_flight (persisted),
- * the CLI resume accepting the message commits delivered, a failure
- * requeues in FIFO order.
- *
- * Honest limits:
- *   - Claude Code: resuming a session that is mid-turn in a live TUI can
- *     interleave; we serialize per member and requeue on failure, but the
- *     platform gives no busy-check API.
- *   - Codex CLI: `codex exec resume` is documented for exec sessions;
- *     resuming TUI-created sessions is NOT verified (guarded by live test
- *     when the codex CLI is present).
- *   - Claude Desktop / ChatGPT: no session identity and no resume API â€”
- *     they stay PULL (a platform limit, not an OpenComms one).
+ * Resume delivery uses argv-only child processes and persisted two-phase queues.
+ * The host exposes no busy-check API; concurrent TUI turns may interleave.
+ * Codex TUI-session resume remains unverified. Hosts without a verified native
+ * session binding or resume command stay on pull delivery.
  */
 
 import { execFile } from "node:child_process"
+import { existsSync } from "node:fs"
 import type { Member, State } from "../core/types.js"
 import {
   commitDelivery,
   drainForDelivery,
   effectiveEndpointCapabilities,
   formatUntrustedMessage,
+  type MessageEnvelope,
   requeueFailedDelivery,
 } from "../core/engine.js"
 
@@ -80,13 +64,11 @@ const BUILDERS: Record<string, SpawnCommandBuilder> = {
 }
 
 /**
- * Windows argv budget (Reviewer P2-2): CreateProcess caps the WHOLE command
+ * Windows argv budget: CreateProcess caps the WHOLE command
  * line at 32,767 chars; POSIX caps a single arg at 128 KiB
- * (MAX_ARG_STRLEN). Keep conservative headroom.
- *
- * Delivery policy (issue #3): FIFO partial drain under the budget. Only the
- * head message being individually oversized refuses delivery (queue intact).
- * Later messages that do not fit remain pending for the next cycle.
+ * (MAX_ARG_STRLEN). Keep conservative headroom. Oversized batches are
+ * refused BEFORE draining (queued mail preserved, never truncated) with an
+ * actionable error.
  */
 export const SPAWN_ARGV_BUDGET: Record<string, number> = { win32: 30_000, default: 120_000 }
 
@@ -121,13 +103,13 @@ export function parseCommandTemplate(raw: string): string[] {
     current += ch
     hasContent = true
   }
-  if (inQuotes) throw new Error(`unterminated quote in command template: ${raw.slice(0, 80)}`)
+  if (inQuotes) throw new Error("unterminated quote in host command template")
   if (current.length > 0 || hasContent) tokens.push(current)
   return tokens
 }
 
 /**
- * Binary override resolution (Reviewer P2-1). The env value is either:
+ * Binary override resolution. The env value is either:
  *  - a plain executable path/name (argv[0] verbatim), or
  *  - a command template whose FIRST token is the executable and whose
  *    REMAINING tokens are PREPENDED to the builder's args — e.g.
@@ -141,6 +123,8 @@ export function resolveBinaryOverride(
 ): { command: string; prependArgs: string[] } {
   const raw = envValue?.trim()
   if (!raw) return { command: defaultBinary, prependArgs: [] }
+  // An existing unquoted path with spaces is a binary, not a template.
+  if (existsSync(raw)) return { command: raw, prependArgs: [] }
   if (!/["\s]/.test(raw)) return { command: raw, prependArgs: [] }
   const tokens = parseCommandTemplate(raw)
   if (tokens.length === 0) return { command: defaultBinary, prependArgs: [] }
@@ -179,6 +163,9 @@ export function spawnDeliveryRefusal(member: Member): string | null {
   if (!member.host_session_id || !member.host_session_id.trim()) {
     return "member has no bound host_session_id (the host lifecycle hook has not bound a session yet)"
   }
+  if (member.host_session_id.startsWith("-") || /[\r\n\0]/.test(member.host_session_id)) {
+    return "bound host_session_id is not a valid positional CLI identity"
+  }
   if (!spawnBuilderFor(member.host)) {
     return `host "${member.host}" has no documented non-interactive resume API`
   }
@@ -201,7 +188,13 @@ export function defaultSpawn(
       { cwd: cmd.cwd, timeout: 10 * 60_000, maxBuffer: 10 * 1024 * 1024, windowsHide: true },
       (error, stdout) => {
         if (error) {
-          resolve({ ok: false, error: `${error.message}${stdout ? ` | stdout: ${stdout.slice(0, 400)}` : ""}` })
+          // execFile's message contains the full argv, including peer content;
+          // stdout/stderr may include secrets. Persist only process metadata.
+          const failure = error as NodeJS.ErrnoException & { killed?: boolean; signal?: string }
+          resolve({
+            ok: false,
+            error: `host CLI failed (code ${failure.code ?? "unknown"}, signal ${failure.signal ?? "none"}, timed out ${failure.killed === true})`,
+          })
         } else {
           resolve({ ok: true, stdout: stdout.slice(0, 2_000) })
         }
@@ -293,33 +286,50 @@ export interface SpawnRunnerDeps {
 
 /** Message ids already reported by the size guard (dedup per process). */
 const sizeGuardReported = new Set<string>()
+const activeSpawnDeliveries = new Set<string>()
+
+/** Conservative CreateProcess quoting / POSIX UTF-8 argument accounting. */
+export function spawnArgumentCost(value: string, platform = process.platform): number {
+  return platform === "win32" ? 2 * value.length + 3 : Buffer.byteLength(value, "utf8") + 1
+}
+
+/** Reserve the member before any asynchronous work, including the drain. */
+export async function deliverViaSpawn(deps: SpawnRunnerDeps, member: Member): Promise<SpawnOutcome> {
+  if (activeSpawnDeliveries.has(member.session_id) || deps.isDelivering?.(member.session_id)) {
+    return { status: "skipped", detail: "a spawn delivery is already in flight for this member" }
+  }
+  activeSpawnDeliveries.add(member.session_id)
+  deps.setDelivering?.(member.session_id, true)
+  try {
+    return await deliverViaSpawnInner(deps, member)
+  } finally {
+    activeSpawnDeliveries.delete(member.session_id)
+    deps.setDelivering?.(member.session_id, false)
+  }
+}
 
 /**
  * Deliver ALL pending messages for one spawn_push member by resuming its
  * host session once with the framed batch. Two-phase + FIFO-requeue on
  * failure, identical guarantees to the OpenCode push path.
  *
- * Oversized batches are refused BEFORE draining (Reviewer P2-2): queued
+ * Oversized batches are refused BEFORE draining: queued
  * mail is preserved untouched, one actionable error is recorded, and no
  * doomed spawn loop is ever entered. Peer content is never truncated.
  */
-export async function deliverViaSpawn(deps: SpawnRunnerDeps, member: Member): Promise<SpawnOutcome> {
+async function deliverViaSpawnInner(deps: SpawnRunnerDeps, member: Member): Promise<SpawnOutcome> {
   const refusal = spawnDeliveryRefusal(member)
   if (refusal) return { status: "skipped", detail: refusal }
-  if (deps.isDelivering?.(member.session_id)) {
-    return { status: "skipped", detail: "a spawn delivery is already in flight for this member" }
-  }
 
-  // Argv size guard (issue #3 / P2-2): framing adds ~450 chars per envelope;
-  // the builder's fixed argv adds a little more. FIFO: drain every message
-  // that still fits; leave the rest pending. Only refuse when the *head*
-  // pending message alone cannot fit under the platform budget.
+  // Argv size guard (issue #3 / P2-2): partial FIFO drain under platform budget.
+  // JOIN separators are only charged *between* framed messages (not on the head).
+  // Framing uses spawnArgumentCost(formatUntrustedMessage(...)) so estimates match
+  // the argv that is actually spawned.
   const builder = spawnBuilderFor(member.host)!
   const budget = spawnArgvBudget()
-  const FRAMING_PER_MSG = 450
-  const JOIN_SEP = Buffer.byteLength("\n\n---\n\n", "utf8") // 7
+  const JOIN = "\n\n---\n\n"
+  const joinCost = spawnArgumentCost(JOIN)
 
-  // Phase 1 (locked): head-only oversized refusal, else partial drain.
   let batch: Array<{ id: string; channelName: string }> = []
   let framed = ""
   let headOversizedId: string | null = null
@@ -327,26 +337,46 @@ export async function deliverViaSpawn(deps: SpawnRunnerDeps, member: Member): Pr
     await deps.withLock(() => {
       const state = deps.load()
       const cmd = builder.buildResumeCommand({ hostSessionId: member.host_session_id as string, cwd: deps.cwd })
-      const fixedOverhead = Buffer.byteLength(cmd.command, "utf8") + Buffer.byteLength(cmd.args.join(" "), "utf8") + 64
+      const fixedOverhead = [cmd.command, ...cmd.args].reduce((sum, arg) => sum + spawnArgumentCost(arg), 64)
 
+      // Head-only oversized refusal (consistent accounting: no JOIN on first msg).
       for (const id of state.queues[member.session_id] ?? []) {
         const msg = state.messages[id]
         if (!msg || msg.delivery_status !== "pending") continue
-        const headCost = fixedOverhead + Buffer.byteLength(msg.content, "utf8") + FRAMING_PER_MSG
+        const channelName =
+          Object.values(state.channels).find((channel) => channel.id === msg.channel_id)?.name ?? msg.channel_id
+        const headCost = fixedOverhead + spawnArgumentCost(formatUntrustedMessage(msg, channelName))
         if (headCost > budget) headOversizedId = id
         break
       }
       if (headOversizedId) return null
 
-      let used = fixedOverhead
-      const canDeliver = (msg: { content: string }) => {
-        const cost = Buffer.byteLength(msg.content, "utf8") + FRAMING_PER_MSG + JOIN_SEP
-        if (used + cost > budget) return false
-        used += cost
+      // Running argv cost of messages already accepted into this batch.
+      let batchArgv = 0
+      let count = 0
+      const canDeliver = (msg: MessageEnvelope) => {
+        const channelName =
+          Object.values(state.channels).find((channel) => channel.id === msg.channel_id)?.name ?? msg.channel_id
+        const framedCost = spawnArgumentCost(formatUntrustedMessage(msg, channelName))
+        const sep = count === 0 ? 0 : joinCost
+        if (fixedOverhead + batchArgv + sep + framedCost > budget) return false
+        batchArgv += sep + framedCost
+        count += 1
         return true
       }
+
+      const queueSnapshot = () =>
+        JSON.stringify((state.queues[member.session_id] ?? []).map((id) => [id, state.messages[id]?.delivery_status]))
+      const before = queueSnapshot()
       const pairs = drainForDelivery(state, member.session_id, { canDeliver })
-      if (pairs.length > 0) deps.save(state)
+      framed = pairs
+        .flatMap((pair) => {
+          const msg = state.messages[pair.message_id]
+          return msg ? [formatUntrustedMessage(msg, pair.channel_name)] : []
+        })
+        .join(JOIN)
+      // Terminal queue cleanup is a durable outcome even without a spawn.
+      if (pairs.length > 0 || before !== queueSnapshot()) deps.save(state)
       batch = pairs.map((p) => ({ id: p.message_id, channelName: p.channel_name }))
       return null
     })
@@ -364,21 +394,8 @@ export async function deliverViaSpawn(deps: SpawnRunnerDeps, member: Member): Pr
     return { status: "skipped", detail: `batch exceeds the spawn argv limit (~${budget} chars); queue left untouched` }
   }
   if (batch.length === 0) return { status: "skipped", detail: "no pending messages" }
-
-  // Frame the batch from a fresh snapshot (per-envelope channel provenance).
-  try {
-    const snapshot = deps.load()
-    const parts: string[] = []
-    for (const item of batch) {
-      const msg = snapshot.messages[item.id]
-      if (msg) parts.push(formatUntrustedMessage(msg, item.channelName))
-    }
-    framed = parts.join("\n\n---\n\n")
-  } catch {
-    framed = ""
-  }
   if (!framed) {
-    // Snapshots lost the envelopes (pruned concurrently) â€” requeue by ids.
+    // Snapshots lost the envelopes (pruned concurrently) — requeue by ids.
     try {
       await deps.withLock(() => {
         const state = deps.load()
@@ -400,11 +417,9 @@ export async function deliverViaSpawn(deps: SpawnRunnerDeps, member: Member): Pr
     cwd: deps.cwd,
   })
 
-  deps.setDelivering?.(member.session_id, true)
   try {
     const result = await deps.spawn(cmd, framed)
     if (result.ok) {
-      // Phase 2 (locked): the host CLI accepted + ran the turn.
       await deps.withLock(() => {
         const state = deps.load()
         commitDelivery(
@@ -420,13 +435,10 @@ export async function deliverViaSpawn(deps: SpawnRunnerDeps, member: Member): Pr
         detail: `resumed ${builder.binary} session ${member.host_session_id} with ${batch.length} message(s)`,
       }
     }
-    // Failure: requeue in original FIFO order + visible error. Windows
-    // npm .cmd/.bat shims cannot be spawned without a shell (Node's
-    // CVE-2024-27980 fix) — enrich EINVAL with the actionable override.
     const failureDetail =
       /\bEINVAL\b/.test(result.error) || isWindowsShimPath(cmd.command)
         ? result.error +
-          ' | Windows shim/no-shell spawn failed: set OPENCOMMS_CLAUDE_BIN / OPENCOMMS_CODEX_BIN to a native executable or a command template, e.g. OPENCOMMS_CODEX_BIN="node C:\\path\\to\\codex.js"'
+          ' | Windows shim/no-shell spawn failed: set OPENCOMMS_CLAUDE_BIN / OPENCOMMS_CODEX_BIN to a native executable or a command template, e.g. OPENCOMMS_CODEX_BIN="node C:\\\\path\\\\to\\\\codex.js"'
         : result.error
     await deps.withLock(() => {
       const state = deps.load()
@@ -458,7 +470,6 @@ export async function deliverViaSpawn(deps: SpawnRunnerDeps, member: Member): Pr
       /* best effort */
     }
     return { status: "failed", detail: (error as Error).message }
-  } finally {
-    deps.setDelivering?.(member.session_id, false)
   }
 }
+

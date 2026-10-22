@@ -1,38 +1,40 @@
 /**
- * Orchestrator persistent state.
- *
- * Stored at `<project>/.opencomms/orchestrator.json` BESIDE the channel state
- * (Lead Decision Log 2026-09-11) so channel-schema evolution never touches
- * orchestration. Same discipline as `StateStore`: atomic temp+rename saves,
- * an exclusive cross-process lockfile (`.orchestrator.lock`, same stale-break
- * and timeout semantics as the state lock), fail-closed shape validation, and
- * corrupt/tampered files rejected to a fresh store with the reason recorded.
- *
- * Keys: agents are `agt_*` (PRIMARY key; Lead decision 2026-09-11(3)); the
- * runtime-native session id (`host_session_id`, e.g. OpenCode `ses_*`) is an
- * attribute for delivery routing, never a key. Nodes are `node_*`; the local
- * node is implicit and always present.
- *
- * Trust (contract v0.1 security note, binding): approve/revoke are
- * unauthenticated-hostile by design. The store holds a per-project
- * `confirm_token` generated at creation, surfaced to the HUMAN via GUI/CLI
- * settings only; it is never returned by any read API and never accepted
- * from agent-facing tool arguments.
+ * Project-local orchestrator.json is separate from channel state.
+ * Writes atomically replace files under a shared cross-process lock; validation fails closed.
+ * Agent ids are keys; host session ids are delivery attributes. The local node is implicit.
+ * The owner token never appears in read APIs or agent-facing tools.
  */
 
 import {
   existsSync,
   mkdirSync,
   readFileSync,
-  renameSync,
   writeFileSync,
   openSync,
   closeSync,
   unlinkSync,
   statSync,
+  copyFileSync,
+  constants,
 } from "node:fs"
 import { join } from "node:path"
+import { replaceStateFile } from "../core/atomic-file.js"
 import { randomBytes, createHash } from "node:crypto"
+import {
+  TASK_SCHEMA_VERSION,
+  MAX_TASKS,
+  MAX_CONTEXT_RECORDS,
+  validTask,
+  validContext,
+  type TaskRecord,
+  type ProjectContextRecord,
+} from "./tasks.js"
+import {
+  TEAM_TEMPLATE_SCHEMA_VERSION,
+  MAX_TEAM_TEMPLATES,
+  validTeamTemplate,
+  type TeamTemplate,
+} from "./team-templates.js"
 
 export const ORCHESTRATOR_FILE = "orchestrator.json"
 export const ORCHESTRATOR_SCHEMA_VERSION = 1
@@ -40,9 +42,9 @@ const ORCHESTRATOR_LOCK = ".orchestrator.lock"
 /** Same lock discipline as the state store (src/core/store.ts). */
 export const ORCH_LOCK_TIMEOUT_MS = 5_000
 export const ORCH_LOCK_STALE_MS = 15_000
-/** Event ring cap (mirrors state.errors cap discipline). */
+
 export const MAX_ORCHESTRATOR_EVENTS = 500
-/** Cap on persisted agent rows (operator scale guard, matches member caps). */
+
 export const MAX_ORCHESTRATOR_AGENTS = 64
 
 function sleepAsync(ms: number): Promise<void> {
@@ -53,7 +55,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
-/** ID generators mirror the engine's ocm_/chn_/cor_ pattern. */
 export function newAgentId(): string {
   return `agt_${randomBytes(12).toString("hex")}`
 }
@@ -71,11 +72,8 @@ export function newConfirmToken(): string {
 }
 
 /**
- * M3 pairing code (design §9c-1): short-lived, one-time, OUT-OF-BAND. The
- * coordinator stores only a HASH; the raw code is shown to the operator ONCE
- * (entered on the node). Format: 8-char base32-style (unambiguous, no
- * 0/O/1/I) — human-friendly for manual entry, matching the Codex
- * `manualPairingCode` precedent.
+ * Show the short-lived, one-time code to the owner; persist only its hash.
+ * The alphabet omits ambiguous characters for out-of-band manual entry.
  */
 export function newPairingCode(): { raw: string; hash: string } {
   const alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
@@ -85,7 +83,6 @@ export function newPairingCode(): { raw: string; hash: string } {
   return { raw, hash: createHash("sha256").update(raw).digest("hex") }
 }
 
-/** Default pairing-code validity (Lead binding: short-lived, one-time). */
 export const PAIRING_CODE_TTL_MS = 10 * 60_000
 
 export type AgentRuntimeStatus = "starting" | "running" | "idle" | "stale" | "stopped" | "failed"
@@ -118,23 +115,19 @@ export interface NodeRecord {
   capabilities: NodeCapabilities
   approved_at: number | null
   approved_by: "owner" | null
-  /**
-   * M2 restart policy (design §9b-2): operator-controlled; M2 ships
-   * "manual" ONLY (no auto-respawn). The hook exists so M3 can flip it
-   * per-node without a migration.
-   */
+  /** Operator-controlled restart; no automatic respawn. */
   restart_policy: "manual" | "auto"
-  /** M3 §9c-1: cert SPKI hash — the node identity anchor, pinned at approval. */
+  /** Pinned node public-key fingerprint. */
   fingerprint: string | null
-  /** M3 §9c-1: when the pairing completed (owner approval). */
+
   enrolled_at: number | null
-  /** M3 §9c-4: last heartbeat received from this node. */
+
   last_seen: number | null
-  /** M3 §9c-1/§9c-4: persistent or ephemeral tier (bounded window), not a boolean. */
+  /** Persistent or ephemeral tier determines the credential window. */
   trust_tier: "persistent" | "ephemeral"
-  /** M3 §9c-4: per-node grant set checked PER ACTION ("spawn", "tasks", ...). */
+  /** Grants are checked for each action. */
   grants: string[]
-  /** M3 §9c-3: short-lived cert expiry; renewal = pairing-grade auth. */
+  /** Renewal requires pairing-grade authentication. */
   credential_expires_at: number | null
 }
 
@@ -148,15 +141,21 @@ export interface AgentRecord {
   node_id: string
   worktree: string
   status: AgentRuntimeStatus
+  /** Bounded, redacted recovery detail from the latest managed observation. */
+  status_detail?: string | null
   host_session_id: string | null
   spawn_cmd_redacted: string
-  /** Contract v0.3 §9: exactly ONE agent per project may hold "lead". Immutable. */
+  /** At most one immutable designated lead per project. */
   designated: "lead" | null
   channel_ids: string[]
   last_heartbeat: number | null
   created_at: number
   restart_count: number
   model: string | null
+  /** Optional idempotency journal for explicitly managed creation. */
+  operation_id?: string
+  operation_fingerprint?: string
+  required_capabilities?: string[]
 }
 
 export interface TrustState {
@@ -164,11 +163,7 @@ export interface TrustState {
   owner_confirm_token: string
   approved_node_ids: string[]
   pending_pairing_requests: Array<{ node_id: string; requested_at: number }>
-  /**
-   * M3 pairing (design §9c-1): one-time codes the owner enters to authorize
-   * cert issuance. Generated by the coordinator, delivered OUT-OF-BAND to
-   * the operator on the node; expired codes are dead (short-lived).
-   */
+  /** Out-of-band, one-time codes; expiry prevents certificate issuance. */
   pairing_codes: Array<{ code_hash: string; node_name: string; expires_at: number; used_at: number | null }>
 }
 
@@ -181,6 +176,14 @@ export interface OrchestratorState {
   events_cursor: number
   serve: { port: number | null; password_redacted: boolean }
   trust: TrustState
+  /** Additive versioned extension of the existing orchestration store. */
+  task_schema_version: number
+  tasks: TaskRecord[]
+  project_context: ProjectContextRecord[]
+  team_template_schema_version: number
+  team_templates: TeamTemplate[]
+  /** Durable operator emergency state, scoped to this project. */
+  coordination?: { stopped: boolean; emergency_paused_channels: string[] }
 }
 
 export function emptyOrchestratorState(worktree: string): OrchestratorState {
@@ -209,6 +212,11 @@ export function emptyOrchestratorState(worktree: string): OrchestratorState {
     events: [],
     events_cursor: 0,
     serve: { port: null, password_redacted: true },
+    task_schema_version: TASK_SCHEMA_VERSION,
+    tasks: [],
+    project_context: [],
+    team_template_schema_version: TEAM_TEMPLATE_SCHEMA_VERSION,
+    team_templates: [],
     trust: {
       owner_confirm_token: newConfirmToken(),
       approved_node_ids: [],
@@ -261,10 +269,23 @@ function isValidAgent(a: unknown): boolean {
     typeof a["worktree"] === "string" &&
     typeof a["status"] === "string" &&
     AGENT_STATUSES.includes(a["status"]) &&
+    (a["status_detail"] === undefined ||
+      a["status_detail"] === null ||
+      (typeof a["status_detail"] === "string" && a["status_detail"].length <= 2_000)) &&
     (typeof a["host_session_id"] === "string" || a["host_session_id"] === null) &&
     typeof a["spawn_cmd_redacted"] === "string" &&
     (designated === "lead" || designated === null) &&
-    Array.isArray(a["channel_ids"])
+    Array.isArray(a["channel_ids"]) &&
+    (a["operation_id"] === undefined ||
+      (typeof a["operation_id"] === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(a["operation_id"]))) &&
+    (a["operation_fingerprint"] === undefined ||
+      (typeof a["operation_fingerprint"] === "string" && /^[0-9a-f]{64}$/.test(a["operation_fingerprint"]))) &&
+    (a["required_capabilities"] === undefined ||
+      (Array.isArray(a["required_capabilities"]) &&
+        a["required_capabilities"].length <= 16 &&
+        a["required_capabilities"].every(
+          (cap: unknown) => typeof cap === "string" && /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(cap),
+        )))
   )
 }
 
@@ -304,8 +325,7 @@ export function validateOrchestratorState(
   if (!Array.isArray(agents) || agents.length > MAX_ORCHESTRATOR_AGENTS || !agents.every((a) => isValidAgent(a))) {
     return { ok: false, reason: "agents has invalid shape" }
   }
-  // One role cannot be held by two agents with the same designated marker:
-  // at most ONE designated:"lead" row may exist (contract v0.3 §9).
+  // At most one agent may be designated lead.
   const designatedLeads = (agents as unknown[]).filter(
     (a) => isRecord(a) && (a as unknown as AgentRecord).designated === "lead",
   )
@@ -317,11 +337,62 @@ export function validateOrchestratorState(
     return { ok: false, reason: "trust has invalid shape" }
   }
   if (!isRecord(parsed["serve"])) return { ok: false, reason: "serve is not an object" }
+  const taskVersion = parsed["task_schema_version"]
+  const coordination = parsed["coordination"]
+  if (
+    coordination !== undefined &&
+    (!isRecord(coordination) ||
+      typeof coordination["stopped"] !== "boolean" ||
+      !Array.isArray(coordination["emergency_paused_channels"]) ||
+      coordination["emergency_paused_channels"].length > 256 ||
+      !coordination["emergency_paused_channels"].every(
+        (name: unknown) => typeof name === "string" && /^[a-z0-9][a-z0-9-_]{0,63}$/.test(name),
+      ))
+  )
+    return { ok: false, reason: "coordination has invalid shape" }
+  if (
+    parsed["team_template_schema_version"] !== undefined &&
+    parsed["team_template_schema_version"] !== TEAM_TEMPLATE_SCHEMA_VERSION
+  )
+    return { ok: false, reason: "team_template_schema_version mismatch" }
+  const templates = parsed["team_templates"]
+  if (
+    templates !== undefined &&
+    (!Array.isArray(templates) ||
+      templates.length > MAX_TEAM_TEMPLATES ||
+      !templates.every(validTeamTemplate) ||
+      new Set(templates.map((t) => (t as TeamTemplate).id)).size !== templates.length)
+  )
+    return { ok: false, reason: "team_templates has invalid shape" }
+  if (taskVersion !== undefined && taskVersion !== TASK_SCHEMA_VERSION)
+    return { ok: false, reason: "task_schema_version mismatch" }
+  if (
+    parsed["tasks"] !== undefined &&
+    (!Array.isArray(parsed["tasks"]) || parsed["tasks"].length > MAX_TASKS || !parsed["tasks"].every(validTask))
+  )
+    return { ok: false, reason: "tasks has invalid shape" }
+  if (
+    parsed["project_context"] !== undefined &&
+    (!Array.isArray(parsed["project_context"]) ||
+      parsed["project_context"].length > MAX_CONTEXT_RECORDS ||
+      !parsed["project_context"].every(validContext))
+  )
+    return { ok: false, reason: "project_context has invalid shape" }
+  if (
+    Array.isArray(parsed["tasks"]) &&
+    new Set(parsed["tasks"].map((t) => (t as TaskRecord).task_id)).size !== parsed["tasks"].length
+  )
+    return { ok: false, reason: "duplicate task ids" }
   return { ok: true, state: parsed as unknown as OrchestratorState }
 }
 
 /** Backfill optional fields on freshly-read state (additive evolution). */
 export function backfillOrchestratorState(state: OrchestratorState): void {
+  state.task_schema_version ??= TASK_SCHEMA_VERSION
+  state.tasks ??= []
+  state.project_context ??= []
+  state.team_template_schema_version ??= TEAM_TEMPLATE_SCHEMA_VERSION
+  state.team_templates ??= []
   for (const agent of state.agents) {
     if (agent.designated === undefined) agent.designated = null
     if (!Array.isArray(agent.channel_ids)) agent.channel_ids = []
@@ -330,10 +401,9 @@ export function backfillOrchestratorState(state: OrchestratorState): void {
     if (typeof agent.model !== "string") agent.model = null
   }
   for (const node of state.nodes) {
-    // M2 restart_policy backfill: old nodes default to "manual" (binding).
+    // Legacy nodes retain manual restart.
     if (node.restart_policy !== "manual" && node.restart_policy !== "auto") node.restart_policy = "manual"
-    // M3 §9c-1 backfill: identity fields default to null/ungranted; the
-    // local node is implicitly persistent with full grants.
+    // Legacy identities default to ungranted; only the local node receives full grants.
     if (typeof node.fingerprint !== "string") node.fingerprint = null
     if (typeof node.enrolled_at !== "number") node.enrolled_at = null
     if (typeof node.last_seen !== "number") node.last_seen = null
@@ -351,15 +421,13 @@ export function backfillOrchestratorState(state: OrchestratorState): void {
 }
 
 export interface OrchestratorStoreDeps {
-  /** Injected lock (reuses the EXISTING StateStore.withLock to avoid two lock implementations). */
+  /** Share StateStore locking; never nest store lock scopes. */
   withLock<T>(fn: () => T): Promise<T>
 }
 
 /**
- * Persistence for orchestrator state. The lock is DELEGATED to the existing
- * StateStore cross-process lock (one lock discipline per .opencomms dir);
- * a separate .orchestrator.lock is only used when no StateStore is available
- * (pure CLI paths). Bare reads stay lock-free: saves are atomic renames.
+ * Use the shared StateStore lock when provided, otherwise .orchestrator.lock.
+ * Reads stay lock-free because saves atomically replace the file.
  */
 export class OrchestratorStore {
   readonly dir: string
@@ -373,15 +441,13 @@ export class OrchestratorStore {
     this.dir = join(projectDir, ".opencomms")
     this.file = join(this.dir, ORCHESTRATOR_FILE)
     this.lockPath = join(this.dir, ORCHESTRATOR_LOCK)
-    this.sharedLock = sharedLock as unknown as ((fn: () => unknown) => Promise<unknown>) | null
+    this.sharedLock = sharedLock ? (fn) => sharedLock.withLock(fn) : null
   }
 
   /** Exclusive cross-process lock; delegates to StateStore.withLock when wired. */
   async withLock<T>(fn: () => T): Promise<T> {
     if (this.sharedLock) {
-      // Never nest: StateStore.withLock is re-entrant-unsafe by design, so
-      // callers of BOTH stores must take ONE lock scope at a time (the API
-      // layer enforces that; see orchestrator/api.ts).
+      // StateStore locks are not reentrant; both stores must share one lock scope.
       return this.sharedLock(fn) as Promise<T>
     }
     return this.ownLock(fn)
@@ -390,13 +456,13 @@ export class OrchestratorStore {
   private async ownLock<T>(fn: () => T): Promise<T> {
     mkdirSync(this.dir, { recursive: true })
     const deadline = Date.now() + ORCH_LOCK_TIMEOUT_MS
+    let fd: number
     for (;;) {
       try {
-        const fd = openSync(this.lockPath, "wx")
-        writeFileSync(fd, `${process.pid}@${Date.now()}`, "utf8")
-        closeSync(fd)
+        fd = openSync(this.lockPath, "wx")
         break
-      } catch {
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
         try {
           if (Date.now() - statSync(this.lockPath).mtimeMs > ORCH_LOCK_STALE_MS) {
             try {
@@ -415,8 +481,10 @@ export class OrchestratorStore {
       }
     }
     try {
+      writeFileSync(fd, `${process.pid}@${Date.now()}`, "utf8")
       return fn()
     } finally {
+      closeSync(fd)
       try {
         unlinkSync(this.lockPath)
       } catch {
@@ -439,6 +507,12 @@ export class OrchestratorStore {
       const parsed: unknown = JSON.parse(readFileSync(this.file, "utf8"))
       const result = validateOrchestratorState(parsed)
       if (!result.ok) {
+        // Preserve rejected/forward-version data before fail-closed recovery.
+        copyFileSync(
+          this.file,
+          join(this.dir, `orchestrator.rejected.${Date.now()}.${randomBytes(4).toString("hex")}.json`),
+          constants.COPYFILE_EXCL,
+        )
         const base = emptyOrchestratorState(this.projectDir)
         base.events.push({
           seq: 1,
@@ -474,24 +548,37 @@ export class OrchestratorStore {
 
   save(state: OrchestratorState): void {
     mkdirSync(this.dir, { recursive: true })
-    const tmp = join(this.dir, `.orchestrator.${process.pid}.${randomBytes(4).toString("hex")}.tmp`)
-    writeFileSync(tmp, JSON.stringify(state, null, 2), "utf8")
-    try {
-      renameSync(tmp, this.file)
-    } catch {
-      // Windows AV/OneDrive races: bounded blocking retry (same discipline as
-      // StateStore.save), then direct write as a last resort.
+    // First write of the additive task extension preserves the exact legacy
+    // orchestration document. Channel messages remain untouched and legacy
+    // acknowledgements migrate only as delivery, never execution evidence.
+    // Malformed bytes must be preserved before ANY overwrite, including
+    // later recoveries after the one-time legacy migration backup exists.
+    if (existsSync(this.file)) {
+      let old: unknown
       try {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50)
-        renameSync(tmp, this.file)
-      } catch (second) {
+        old = JSON.parse(readFileSync(this.file, "utf8"))
+      } catch {
+        copyFileSync(
+          this.file,
+          join(this.dir, `orchestrator.unreadable.${Date.now()}.${randomBytes(4).toString("hex")}.json`),
+          constants.COPYFILE_EXCL,
+        )
+      }
+      if (
+        isRecord(old) &&
+        !existsSync(join(this.dir, "orchestrator.pre-tasks-v1.json")) &&
+        old["orchestrator_schema_version"] === ORCHESTRATOR_SCHEMA_VERSION &&
+        old["task_schema_version"] === undefined
+      ) {
         try {
-          writeFileSync(this.file, JSON.stringify(state, null, 2), "utf8")
-        } catch {
-          throw new Error(`OpenComms: failed to persist orchestrator state (${(second as Error).message})`)
+          copyFileSync(this.file, join(this.dir, "orchestrator.pre-tasks-v1.json"), constants.COPYFILE_EXCL)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
         }
       }
     }
+    const tmp = join(this.dir, `.orchestrator.${process.pid}.${randomBytes(4).toString("hex")}.tmp`)
+    replaceStateFile(this.file, tmp, JSON.stringify(state, null, 2))
   }
 
   /** Load, mutate, save under the lock. The mutation runs synchronously. */
@@ -505,13 +592,11 @@ export class OrchestratorStore {
   }
 }
 
-/** Next sequence number for the event ring. */
 export function nextEventSeq(state: OrchestratorState): number {
   const last = state.events[state.events.length - 1]
   return (last?.seq ?? 0) + 1
 }
 
-/** Append an event, capping the ring (newest kept). */
 export function pushEvent(state: OrchestratorState, event: Omit<OrchestrationEvent, "seq" | "at">): void {
   state.events.push({ ...event, seq: nextEventSeq(state), at: Date.now() })
   if (state.events.length > MAX_ORCHESTRATOR_EVENTS) {
@@ -519,7 +604,6 @@ export function pushEvent(state: OrchestratorState, event: Omit<OrchestrationEve
   }
 }
 
-/** Events after a cursor (cursor = last seq the client saw). */
 export function eventsSince(state: OrchestratorState, since: number): OrchestrationEvent[] {
   return state.events.filter((e) => e.seq > since)
 }

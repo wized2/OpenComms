@@ -1,33 +1,54 @@
-// OpenComms Tauri Desktop GUI — the owner-facing desktop shell. Owns NO
-// business logic and NO policy: it relays Tauri IPC commands to the Node
-// coordinator sidecar over a handshake-validated stdio JSON-RPC bridge
-// (docs/tauri-native-gui.md §8; enforcement lives in the TS core).
+// Native IPC relays to the coordinator; backend validation remains authoritative.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde_json::Value;
-use std::io::{BufRead, BufReader};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Mutex;
+use serde::Serialize;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
+use std::time::{Duration, Instant};
 
-/// Coordinator child: process + the two stdio halves the bridge drives.
-/// Killed on shell exit via Drop.
+mod bridge_io;
+
+/// Owns the child lifetime; dropping kills and reaps it.
 struct Coordinator {
     child: Child,
-    stdin: Mutex<Option<ChildStdin>>,
-    stdout: Mutex<Option<BufReader<ChildStdout>>>,
+    stdin: SyncSender<bridge_io::WriteRequest>,
+    stdout: Receiver<Result<String, String>>,
 }
 
 impl Drop for Coordinator {
     fn drop(&mut self) {
         let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
-/// The per-command IPC allowlist (docs/tauri-native-gui.md §2). Every entry
-/// maps 1:1 to an Orchestrator API route; wildcards are forbidden. The
-/// Rust bridge relays ONLY these commands — no generic proxy.
+struct CoordinatorState {
+    connection: Mutex<Option<Coordinator>>,
+    closing: AtomicBool,
+}
+
+impl CoordinatorState {
+    fn new() -> Self {
+        Self {
+            connection: Mutex::new(None),
+            closing: AtomicBool::new(false),
+        }
+    }
+
+    fn shutdown(&self) {
+        // Tauri exits the process directly, so managed-state destructors are insufficient.
+        self.closing.store(true, Ordering::SeqCst);
+        let mut connection = self.connection.lock().unwrap_or_else(|error| error.into_inner());
+        connection.take();
+    }
+}
+
+/// Explicit operation surface mirrored by src/orchestrator/bridge.ts.
+/// Unknown commands and arbitrary URLs are refused; no generic proxy.
 const ALLOWED_COMMANDS: &[&str] = &[
-    // reads
     "nodes_list",
     "agents_list",
     "tasks_list",
@@ -35,10 +56,21 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "trust_view",
     "sessions_list",
     "session_members",
+    "session_detail",
+    "session_join_command",
+    "capabilities",
     "workspace_state",
     "integrations_list",
+    "integrations_overview",
     "diagnostics",
-    // mutations
+    "runtimes_list",
+    "audit_log",
+    "task_get",
+    "context_list",
+    "context_handoff",
+    "permissions_list",
+    "integration_bootstrap",
+    "team_template_list",
     "session_create",
     "session_save",
     "session_resume",
@@ -47,55 +79,139 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "session_unpause",
     "member_remove",
     "agent_create",
+    "agent_link",
+    "emergency_stop",
     "agent_stop",
     "agent_restart",
     "task_assign",
+    "task_transition",
+    "task_reassign",
+    "team_template_save",
+    "team_template_delete",
+    "context_add",
     "node_approve",
     "node_revoke",
     "workspace_select",
+    "integration_action",
+    "permission_respond",
 ];
 
-/// Handshake constants (§8): the sidecar's FIRST stdout line must announce
-/// this identity + protocol before ANY command is relayed.
+/// The first stdout frame must announce this identity and protocol before commands.
 const HANDSHAKE_ID: &str = "opencomms-coordinator";
 const PROTOCOL_VERSION: u64 = 1;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-/// Spawn the sidecar (beside this exe) or the dev coordinator (repo node),
-/// then read + validate the handshake BEFORE any command can flow. On
-/// mismatch the child is killed and a typed error is returned — a rogue
-/// process can never receive a command (half-open safety; stdin is never
-/// written until the handshake is valid). The handshake is time-bounded BY
-/// PAIR: the bridge's own 10s timer (bridge.ts) exits the process if the
-/// host never acks, so neither side can hang forever.
+#[derive(Debug, Serialize)]
+struct BridgeError {
+    ok: bool,
+    code: &'static str,
+    message: String,
+    request_id: String,
+    operation: String,
+    outcome: &'static str,
+    error: NativeErrorDetail,
+}
 
+#[derive(Debug, Serialize)]
+struct NativeErrorDetail {
+    state: &'static str,
+    recovery: &'static str,
+}
+
+impl BridgeError {
+    fn new(code: &'static str, message: impl Into<String>, request_id: &str, operation: &str, outcome: &'static str) -> Self {
+        let state = match code {
+            "unsupported" => "unsupported",
+            "temporarily_unavailable" => "temporarily_unavailable",
+            _ => "execution_failed",
+        };
+        let recovery = if outcome == "unknown" {
+            "Check persisted operation state before retrying. Use this request ID in Diagnostics."
+        } else {
+            "Correct the request or repair the coordinator connection. The operation was not executed."
+        };
+        Self { ok: false, code, message: message.into(), request_id: request_id.into(), operation: operation.into(), outcome,
+            error: NativeErrorDetail { state, recovery } }
+    }
+}
+
+/// Log connection lifecycle only in per-user app data; never log command bodies.
+fn bridge_log(exe_dir: &std::path::Path, message: &str) {
+    use std::io::Write as _;
+    let directory = fallback_project_dir(exe_dir).join("logs");
+    if std::fs::create_dir_all(&directory).is_err() { return; }
+    let path = directory.join("bridge.log");
+    let entry = format!(
+        "[{}] {}\n",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        message
+    );
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut lines: Vec<&str> = existing.lines().collect();
+    lines.push(entry.trim_end());
+    if lines.len() > 50 {
+        let start = lines.len() - 50;
+        lines = lines[start..].to_vec();
+    }
+    if let Ok(mut f) = std::fs::File::create(&path) {
+        let _ = writeln!(f, "{}", lines.join("\n"));
+    }
+}
+
+/// Validate identity, protocol and operation surface before relaying commands.
+/// The native handshake deadline is independent of the sidecar's deadline.
 fn connect_coordinator() -> Result<Coordinator, String> {
     let exe_dir = std::env::current_exe()
         .map_err(|e| format!("resolve exe: {e}"))?
         .parent()
         .ok_or("no parent dir")?
         .to_path_buf();
-    let sidecar = exe_dir.join("opencomms-coordinator.exe");
-    let project = installed_project_dir(&exe_dir).unwrap_or_else(repo_root);
+    let sidecar = exe_dir.join(if cfg!(windows) { "opencomms-coordinator.exe" } else { "opencomms-coordinator" });
+    let seeded_project = installed_project_dir(&exe_dir);
+    let bootstrap = seeded_project.is_none();
+    let project = seeded_project.unwrap_or_else(|| fallback_project_dir(&exe_dir));
 
     let mut child = if sidecar.exists() {
-        Command::new(&sidecar)
-            .arg("bridge")
-            .arg("--project")
-            .arg(&project)
+        let mut command = Command::new(&sidecar);
+        hide_coordinator_window(&mut command);
+        command.arg("bridge").arg("--project").arg(&project);
+        if bootstrap {
+            command.arg("--bootstrap");
+        }
+        match command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("spawn sidecar: {e}"))?
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("spawn sidecar failed: {e}");
+                bridge_log(&exe_dir, &msg);
+                return Err(msg);
+            }
+        }
     } else {
-        // Dev path: repo coordinator (node dist/cli/main.js).
+        bridge_log(&exe_dir, "sidecar not found beside exe (installed context)");
+        if !cfg!(debug_assertions) {
+            return Err("Bundled coordinator is missing. Repair or reinstall OpenComms.".into());
+        }
         let root = repo_root();
         let script = root.join("dist").join("cli").join("main.js");
         if !script.exists() {
-            return Err(format!("coordinator not found: {}", script.display()));
+            let msg = format!("coordinator not found: {}", script.display());
+            bridge_log(&exe_dir, &msg);
+            return Err(msg);
         }
         let node = if cfg!(windows) { "node.exe" } else { "node" };
-        Command::new(node)
+        let mut command = Command::new(node);
+        hide_coordinator_window(&mut command);
+        match command
             .arg(&script)
             .arg("bridge")
             .arg("--project")
@@ -104,44 +220,43 @@ fn connect_coordinator() -> Result<Coordinator, String> {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("spawn dev coordinator: {e}"))?
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("spawn dev coordinator failed: {e}");
+                bridge_log(&exe_dir, &msg);
+                return Err(msg);
+            }
+        }
     };
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "sidecar stdout unavailable".to_string())?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "sidecar stdin unavailable".to_string())?;
-
-    // Handshake: sidecar speaks FIRST; we validate or kill. The read is
-    // TIME-BOUNDED (condition A): a hung/slow sidecar must not block the
-    // invoke promise forever. Stdin is never written until the handshake
-    // is valid (half-open safety). The blocking read_line is acceptable
-    // here because the invoke runs on Tauri's async runtime and the
-    // sidecar's bridge has its OWN 10s handshake timer (bridge.ts exits
-    // itself if the host never acks) — so the pair cannot hang forever:
-    // whichever timer fires first ends the connection with a typed error.
-    // Rust-side timeout (condition A, Reviewer P4-A): the handshake read is
-    // additionally bounded on OUR side via the child's own 10s exit timer +
-    // this constant as documentation; if Backend's timer is ever removed,
-    // this constant is the contract for spawning a watcher thread.
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) => return Err("coordinator exited before handshake (bridge timer expired)".to_string()),
-        Ok(_) => {}
-        Err(e) => return Err(format!("handshake read failed: {e}")),
-    }
-    let hello: Value =
-        serde_json::from_str(line.trim()).map_err(|e| format!("handshake not JSON: {e}"))?;
+    let pipes = match (child.stdin.take(), child.stdout.take()) {
+        (Some(stdin), Some(stdout)) => (stdin, stdout),
+        _ => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("coordinator stdio unavailable".into());
+        }
+    };
+    // Own the child before validation so every failure kills and reaps it.
+    let coordinator = Coordinator {
+        child,
+        stdin: bridge_io::request_writer(pipes.0),
+        stdout: bridge_io::response_reader(pipes.1),
+    };
+    let line = coordinator.stdout.recv_timeout(HANDSHAKE_TIMEOUT)
+        .map_err(|_| "coordinator handshake timed out after 10 seconds".to_string())??;
+    let hello: Value = serde_json::from_str(line.trim())
+        .map_err(|_| "coordinator handshake is not valid JSON".to_string())?;
     if hello.get("hello").and_then(|v| v.as_str()) != Some(HANDSHAKE_ID) {
-        return Err("handshake identity mismatch — not the OpenComms coordinator".to_string());
+        let msg = "handshake identity mismatch — not the OpenComms coordinator".to_string();
+        bridge_log(&exe_dir, &msg);
+        return Err(msg);
     }
     if hello.get("protocol").and_then(|v| v.as_u64()) != Some(PROTOCOL_VERSION) {
-        return Err("handshake protocol version mismatch".to_string());
+        let msg = "handshake protocol version mismatch".to_string();
+        bridge_log(&exe_dir, &msg);
+        return Err(msg);
     }
     let announced = hello
         .get("api")
@@ -149,77 +264,88 @@ fn connect_coordinator() -> Result<Coordinator, String> {
         .ok_or_else(|| "handshake missing api list".to_string())?;
     for cmd in ALLOWED_COMMANDS {
         if !announced.iter().any(|a| a.as_str() == Some(*cmd)) {
-            return Err(format!("coordinator missing IPC command: {cmd}"));
+            let msg = format!("coordinator missing IPC command: {cmd}");
+            bridge_log(&exe_dir, &msg);
+            return Err(msg);
         }
     }
 
-    // Handshake ack: the sidecar's bridge WAITS for {"hello_ok":true} before
-    // serving ANY command (its pre-ack stdin is dropped without execution).
-    // Without this line every relay lands in the drop window and the 10s
-    // sidecar handshake timer exits the process — Reviewer P1.
-    use std::io::Write;
-    writeln!(stdin, r#"{{"hello_ok":true}}"#).map_err(|e| format!("handshake ack write failed: {e}"))?;
-    stdin.flush().map_err(|e| format!("handshake ack flush failed: {e}"))?;
+    // The sidecar discards pre-ack commands and exits without this acknowledgement.
+    bridge_io::write_frame(&coordinator.stdin, "{\"hello_ok\":true}\n".into(), HANDSHAKE_TIMEOUT)?;
 
-    Ok(Coordinator {
-        child,
-        stdin: Mutex::new(Some(stdin)),
-        stdout: Mutex::new(Some(reader)),
-    })
+    Ok(coordinator)
 }
 
-/// Relay one command. Shape validation only — NO policy decisions here;
-/// the TS core enforces trust exactly as it does over HTTP.
-fn relay(coordinator: &Coordinator, cmd: &str, args: &Value) -> Result<Value, String> {
-    if !ALLOWED_COMMANDS.contains(&cmd) {
-        return Err(format!("command not allowed: {cmd}"));
-    }
-    let req_id = format!(
-        "req-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    );
-    let request = serde_json::json!({ "id": req_id, "cmd": cmd, "args": args });
-    let mut line = serde_json::to_string(&request).map_err(|e| e.to_string())?;
-    line.push('\n');
+fn hide_coordinator_window(command: &mut Command) {
+    #[cfg(windows)]
     {
-        let mut guard = coordinator
-            .stdin
-            .lock()
-            .map_err(|_| "bridge locked".to_string())?;
-        use std::io::Write;
-        let input = guard.as_mut().ok_or("bridge stdin closed")?;
-        input
-            .write_all(line.as_bytes())
-            .and_then(|_| input.flush())
-            .map_err(|e| format!("bridge write failed: {e}"))?;
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    let mut guard = coordinator
-        .stdout
-        .lock()
-        .map_err(|_| "bridge locked".to_string())?;
-    let reader = guard.as_mut().ok_or("bridge closed")?;
-    let mut response = String::new();
-    let n = reader
-        .read_line(&mut response)
-        .map_err(|e| format!("bridge read failed: {e}"))?;
-    if n == 0 {
-        return Err("coordinator closed the bridge".to_string());
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
+fn relay(coordinator: &mut Coordinator, request_id: &str, cmd: &str, args: &Value) -> Result<Value, BridgeError> {
+    if !ALLOWED_COMMANDS.contains(&cmd) {
+        return Err(BridgeError::new("unsupported", "Native operation is not supported.", request_id, cmd, "not_executed"));
     }
-    serde_json::from_str(response.trim())
-        .map_err(|e| format!("bridge response not JSON: {e}"))
+    let request = serde_json::json!({ "id": request_id, "cmd": cmd, "args": args });
+    let mut line = serde_json::to_string(&request)
+        .map_err(|_| BridgeError::new("invalid_request", "Request could not be encoded.", request_id, cmd, "not_executed"))?;
+    line.push('\n');
+    if line.len() > bridge_io::MAX_LINE_BYTES || line.encode_utf16().count().saturating_sub(1) > 1_000_000 {
+        return Err(BridgeError::new("invalid_request", "Request exceeds the native bridge size limit.", request_id, cmd, "not_executed"));
+    }
+    let deadline = Instant::now() + COMMAND_TIMEOUT;
+    bridge_io::write_frame(&coordinator.stdin, line, COMMAND_TIMEOUT)
+        .map_err(|_| BridgeError::new("temporarily_unavailable", "Coordinator connection failed. Check the operation result before retrying.", request_id, cmd, "unknown"))?;
+    let response = coordinator.stdout.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|_| BridgeError::new("temporarily_unavailable", "Coordinator did not respond within 120 seconds. Check the operation result before retrying.", request_id, cmd, "unknown"))?
+        .map_err(|message| BridgeError::new("temporarily_unavailable", message, request_id, cmd, "unknown"))?;
+    bridge_io::validate_response(&response, request_id)
+        .map_err(|message| BridgeError::new("failed", message, request_id, cmd, "unknown"))
 }
 
 fn installed_project_dir(install_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    // The installer may seed a project beside the app; else the owner picks
-    // one in the GUI and the sidecar remembers it (its own state dir).
     let seeded = install_dir.join(".opencomms");
     if seeded.is_dir() {
         return Some(install_dir.to_path_buf())
     }
     None
+}
+
+/// Keep bootstrap storage outside the installation directory and selected project.
+fn fallback_project_dir(install_dir: &std::path::Path) -> std::path::PathBuf {
+    let local_app_data = if cfg!(windows) { std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(std::path::PathBuf::from)
+                .map(|profile| profile.join("AppData").join("Local"))
+        })
+    } else { std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from)
+            .map(|profile| profile.join(".local").join("state")))
+    }.unwrap_or_else(|| std::env::temp_dir());
+    let path = local_app_data.join("OpenComms").join("bridge-runtime");
+    if path == install_dir {
+        std::env::temp_dir().join("OpenComms").join("bridge-runtime")
+    } else {
+        path
+    }
+}
+
+/// The picker returns a candidate; workspace_select validates it in the backend.
+#[tauri::command]
+async fn pick_project() -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("Choose an OpenComms project directory")
+            .pick_folder()
+            .map(|path| path.to_string_lossy().into_owned())
+    }).await.map_err(|_| "Project picker could not be opened.".to_string())
 }
 
 fn repo_root() -> std::path::PathBuf {
@@ -230,34 +356,52 @@ fn repo_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
-/// One thin IPC command. Shape-validation + forward — no policy, no logging
-/// of bodies (token-bearing requests must never reach a log file).
+/// Forward validated request shapes without logging token-bearing bodies.
 #[tauri::command]
-fn orchestrator_invoke(
-    state: tauri::State<'_, std::sync::Mutex<Option<Coordinator>>>,
+async fn orchestrator_invoke(
+    state: tauri::State<'_, Arc<CoordinatorState>>,
     cmd: String,
     args: Value,
-) -> Result<Value, String> {
+) -> Result<Value, BridgeError> {
+    let request_id = format!("native-{}-{}", std::process::id(), REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed));
     if !ALLOWED_COMMANDS.contains(&cmd.as_str()) {
-        return Err(format!("command not allowed: {cmd}"));
+        return Err(BridgeError::new("unsupported", "Native operation is not supported.", &request_id, &cmd, "not_executed"));
     }
-    let mut guard = state
-        .inner()
-        .lock()
-        .map_err(|_| "coordinator state locked".to_string())?;
-    if guard.is_none() {
-        *guard = Some(connect_coordinator()?);
+    if !args.is_object() {
+        return Err(BridgeError::new("invalid_request", "Operation arguments must be an object.", &request_id, &cmd, "not_executed"));
     }
-    let coordinator = guard.as_ref().ok_or("coordinator unavailable")?;
-    relay(coordinator, &cmd, &args)
+    let connection = Arc::clone(state.inner());
+    let operation = cmd.clone();
+    let id = request_id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut guard = connection.connection.lock().map_err(|_| BridgeError::new("failed", "Coordinator state is unavailable. Restart OpenComms.", &id, &operation, "not_executed"))?;
+        if connection.closing.load(Ordering::SeqCst) {
+            return Err(BridgeError::new("temporarily_unavailable", "OpenComms is closing. Reopen it to submit another operation.", &id, &operation, "not_executed"));
+        }
+        if guard.is_none() {
+            *guard = Some(connect_coordinator().map_err(|message| BridgeError::new("temporarily_unavailable", message, &id, &operation, "not_executed"))?);
+        }
+        let result = relay(guard.as_mut().expect("coordinator connected"), &id, &operation, &args);
+        if result.is_err() {
+            // Reconnect only on an explicit request; uncertain mutations must not replay.
+            guard.take();
+        }
+        result
+    }).await.map_err(|_| BridgeError::new("failed", "Native operation worker failed. Check its result before retrying.", &request_id, &cmd, "unknown"))?
 }
 
 fn main() {
-    // The webview loads BUNDLED assets (frontendDist) — no loopback URL.
-    // The bridge connects lazily on the first IPC command.
-    tauri::Builder::default()
-        .manage(std::sync::Mutex::<Option<Coordinator>>::new(None))
-        .invoke_handler(tauri::generate_handler![orchestrator_invoke])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+    // Bundled assets use coordinator IPC; the webview does not load a loopback page.
+    let connection = Arc::new(CoordinatorState::new());
+    let shutdown = Arc::clone(&connection);
+    let app = tauri::Builder::default()
+        .manage(connection)
+        .invoke_handler(tauri::generate_handler![orchestrator_invoke, pick_project])
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+    app.run(move |_app, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            shutdown.shutdown();
+        }
+    });
 }

@@ -1,22 +1,5 @@
 #!/usr/bin/env node
-/**
- * Smoke-test the Linux release tarball in an isolated extraction dir.
- * Linux counterpart of scripts/test-windows-release.mjs (M1, Platform).
- *
- * Verifies, WITHOUT any package manager or privileged command:
- *   1. the tarball contains exactly the approved layout,
- *   2. SHA256SUMS verifies (sha256sum -c semantics),
- *   3. the SEA exe answers `version` and `doctor` from the extraction dir,
- *   4. `install.sh --service` (with isolated env) writes a RESOLVED,
- *      correctly-QUOTED unit for a spaced project path and nothing else,
- *   5. `gui --server --no-open` answers the loopback workspace endpoint,
- *      with project state anchored at --project (never the CWD/install dir),
- *   6. SIGTERM stops it gracefully (the unit's KillSignal default),
- *   7. project `.opencomms/state.json` is untouched afterwards.
- *
- * MUST run on Linux (per verification honesty: Linux features are verified
- * on Linux only). Planned execution: Linux CI job.
- */
+/** Linux release smoke: verify payload, installer rollback and state preservation. */
 import { execFileSync, spawn } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -32,13 +15,17 @@ if (process.platform !== "linux") {
 
 const repoRoot = resolve(join(fileURLToPath(new URL("..", import.meta.url))))
 const releaseDir = join(repoRoot, "dist-release")
-const tarball = readdirSync(releaseDir)
-  .filter((name) => /^opencomms-linux-.*\.tar\.gz$/.test(name))
-  .map((name) => join(releaseDir, name))[0]
-if (!tarball || !existsSync(tarball))
+const packageVersion = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")).version
+const tarball = join(releaseDir, `opencomms-linux-${packageVersion}-x86_64.tar.gz`)
+const sourceExe = join(releaseDir, "opencomms")
+if (!existsSync(tarball) || !existsSync(sourceExe))
   throw annotated(
-    new Error("No opencomms-linux-*.tar.gz found in dist-release (run npm run build:release on Linux first)."),
+    new Error(
+      `Current release ${packageVersion} tarball or executable is missing (run npm run build:release on Linux first).`,
+    ),
   )
+const smokeEnv = { ...process.env }
+delete smokeEnv.OPENCOMMS_VERSION
 
 const root = join(tmpdir(), `opencomms-linux-smoke-${process.pid}`)
 const extractDir = join(root, "extract")
@@ -71,6 +58,81 @@ function annotated(error) {
 
 function sha256(file) {
   return createHash("sha256").update(readFileSync(file)).digest("hex")
+}
+
+function verifyDownloadChecksums(installer) {
+  const tools = join(root, "download-tools")
+  const sumsFile = join(root, "download-SHA256SUMS")
+  const downloadLog = join(root, "download-urls.txt")
+  const downloadBin = join(homeDir, "download-bin")
+  const tarballName = `opencomms-linux-${packageVersion}-x86_64.tar.gz`
+  const tarballUrl = `https://github.com/CL-BAF/OpenComms/releases/download/v${packageVersion}/${tarballName}`
+  mkdirSync(tools)
+  writeFileSync(
+    join(tools, "curl"),
+    `#!/bin/sh
+set -eu
+out=""
+url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out=$2; shift 2 ;;
+    *) url=$1; shift ;;
+  esac
+done
+printf '%s\\n' "$url" >> "$OPENCOMMS_SMOKE_DOWNLOAD_LOG"
+if [ "$url" = "$OPENCOMMS_SMOKE_TARBALL_URL" ]; then
+  cp "$OPENCOMMS_SMOKE_TARBALL" "$out"
+elif [ "$url" = "$OPENCOMMS_SMOKE_SUMS_URL" ]; then
+  cp "$OPENCOMMS_SMOKE_MANIFEST" "$out"
+else
+  exit 19
+fi
+`,
+    "utf8",
+  )
+  chmodSync(join(tools, "curl"), 0o755)
+  const env = {
+    ...smokeEnv,
+    HOME: homeDir,
+    XDG_CONFIG_HOME: configDir,
+    PATH: `${tools}:${process.env.PATH}`,
+    OPENCOMMS_SMOKE_DOWNLOAD_LOG: downloadLog,
+    OPENCOMMS_SMOKE_TARBALL_URL: tarballUrl,
+    OPENCOMMS_SMOKE_SUMS_URL: `https://github.com/CL-BAF/OpenComms/releases/download/v${packageVersion}/SHA256SUMS`,
+    OPENCOMMS_SMOKE_TARBALL: tarball,
+    OPENCOMMS_SMOKE_MANIFEST: sumsFile,
+  }
+  const args = ["--version", `v${packageVersion}`, "--bin-dir", downloadBin, "--no-path-edit"]
+  const tarballEntry = `${sha256(tarball)}  ${tarballName}\n`
+  const otherPlatformEntry = `${"f".repeat(64)}  OpenComms-Setup-${packageVersion}.exe\n`
+  writeFileSync(sumsFile, tarballEntry + otherPlatformEntry)
+  execFileSync(installer, args, { env, stdio: "pipe", timeout: 60_000 })
+  const downloadedExe = join(downloadBin, "opencomms")
+  check(
+    sha256(downloadedExe) === sha256(sourceExe),
+    "Download installer failed to install the tarball from a mixed-platform checksum manifest.",
+  )
+  check(
+    readFileSync(downloadLog, "utf8").split("\n").includes(tarballUrl),
+    "Download installer requested a filename different from the release builder.",
+  )
+  for (const [name, manifest, expectedError] of [
+    ["incorrect", `${"0".repeat(64)}  ${tarballName}\n`, /checksum verification FAILED/],
+    ["missing", otherPlatformEntry, /exactly one entry/],
+    ["duplicate", tarballEntry + tarballEntry, /exactly one entry/],
+    ["malformed", `not-a-hash  ${tarballName}\n`, /checksum entry is malformed/],
+  ]) {
+    writeFileSync(sumsFile, manifest)
+    let refused = false
+    try {
+      execFileSync(installer, args, { env, stdio: "pipe", timeout: 60_000 })
+    } catch (error) {
+      refused = expectedError.test(String(error.stderr ?? error.message))
+    }
+    check(refused, `Download installer did not refuse a ${name} tarball checksum entry.`)
+    check(sha256(downloadedExe) === sha256(sourceExe), `A ${name} checksum entry modified the installed binary.`)
+  }
 }
 
 async function waitForGui(url, timeoutMs = 30_000) {
@@ -116,14 +178,11 @@ function stopSmokeGui() {
 }
 
 try {
-  // 1. Isolated extraction.
   mkdirSync(extractDir, { recursive: true })
   execFileSync("tar", ["-xzf", tarball, "-C", extractDir], { stdio: "inherit" })
   const payloadDir = join(extractDir, "opencomms")
 
-  // 2. Exact approved layout (Lead amendment 5 + install.sh decision).
-  // SHA256SUMS ships in the payload; it cannot list itself (self-hash
-  // recursion), so the layout has 5 files but the checksum list has 4.
+  // SHA256SUMS lists payload files and cannot include its own hash.
   const expected = ["opencomms", "opencomms.service", "install.sh", "README-linux.txt", "SHA256SUMS"]
   for (const name of expected) {
     check(existsSync(join(payloadDir, name)), `Tarball payload missing: opencomms/${name}`)
@@ -137,12 +196,7 @@ try {
     check((mode & 0o111) === 0o111, `Tarball payload opencomms/${name} is not executable (mode ${mode.toString(8)}).`)
   }
 
-  // 3. SHA256SUMS verifies (same semantics as `sha256sum -c SHA256SUMS`).
-  // Reviewer P3: normalize each line (trim trailing whitespace/CR) before
-  // splitting, so a trailing-space or CRLF-contaminated file fails the
-  // hash/name checks loudly instead of producing undefined name parts.
-  // SHA256SUMS ships INSIDE the payload (builder copies it there); it
-  // lists the 4 payload files, not itself.
+  // Normalize CRLF and trailing whitespace before checking checksum entries.
   const sums = readFileSync(join(payloadDir, "SHA256SUMS"), "utf8")
     .split("\n")
     .map((line) => line.replace(/\r$/, "").trim())
@@ -160,19 +214,19 @@ try {
     check(actual === hash, `SHA256 mismatch for ${name}.`)
   }
 
-  // 4. The exe runs from the extraction dir (no Node needed on target).
   const exe = join(payloadDir, "opencomms")
-  check(execFileSync(exe, ["version"], { encoding: "utf8" }).includes("opencomms "), "Exe did not answer to version.")
+  check(
+    execFileSync(exe, ["version"], { encoding: "utf8", env: smokeEnv }).match(/^opencomms ([^\s]+)/)?.[1] ===
+      packageVersion,
+    "Tarball executable does not report the current package version.",
+  )
+  check(sha256(exe) === sha256(sourceExe), "Tarball contains a different executable from the current release build.")
   const doctor = execFileSync(exe, ["doctor", "--project", projectDir], { encoding: "utf8" })
   check(doctor.includes("OpenComms doctor"), "Exe did not answer to doctor.")
 
-  // 5. install.sh: spaced project path, isolated HOME/XDG env, template read.
   const spacedProject = join(root, "My Projects", "demo repo")
   mkdirSync(join(spacedProject, ".opencomms"), { recursive: true })
   mkdirSync(configDir, { recursive: true })
-  // The preserved-state file lives under projectDir (stage 7/8 assertions);
-  // its parent dirs must exist before the write (Windows counterpart does
-  // the same at its try{} head — this test does it here, next to the write).
   mkdirSync(join(projectDir, ".opencomms"), { recursive: true })
   writeFileSync(projectState, preservedState, "utf8")
   const binDir = join(homeDir, ".local", "bin")
@@ -186,6 +240,12 @@ try {
   )
   const installedExe = join(binDir, "opencomms")
   check(existsSync(installedExe), "install.sh did not install the binary.")
+  check(sha256(installedExe) === sha256(sourceExe), "Linux installer did not preserve the release executable bytes.")
+  check(
+    execFileSync(installedExe, ["version"], { encoding: "utf8", env: smokeEnv }).match(/^opencomms ([^\s]+)/)?.[1] ===
+      packageVersion,
+    "Installed Linux executable does not report the current package version.",
+  )
   const unitFile = join(configDir, "systemd", "user", "opencomms.service")
   check(existsSync(unitFile), "install.sh did not write the unit.")
   const unit = readFileSync(unitFile, "utf8")
@@ -197,15 +257,8 @@ try {
   check(/^AssertPathIsDirectory="[^"]+"$/m.test(unit), "Unit AssertPathIsDirectory is not quoted.")
   check(unit.includes(spacedProject), "Unit does not reference the spaced project path.")
   check(!/[@]BIN@|[@]PROJECT_DIR@/.test(unit), "Unit still contains unresolved placeholders.")
-  // systemd would parse-verify here on a real box: `systemctl --user cat
-  // opencomms` — requires a live user bus; asserted statically above.
-  // install.sh must never execute systemctl enable/start or linger actions,
-  // and must never reference sudo in CODE. (daemon-reload-on-replace is the
-  // one Lead-approved exception — assert exactly that.)
-  // Reviewer-P2 fixes: the sudo scan must ignore comments (install.sh's own
-  // privilege-policy comment legitimately says "no sudo"), and the executed
-  // line filter must skip heredoc CONTENT (usage() help text mentions
-  // systemctl but is a printed string, not an executed command).
+  // Only daemon-reload may run; service activation and privilege commands remain instructions.
+  // Exclude comments, printed help and heredocs when inspecting executed commands.
   const rawInstaller = readFileSync(join(payloadDir, "install.sh"), "utf8")
   check(
     !rawInstaller.includes("\r"),
@@ -229,9 +282,7 @@ try {
   })()
   const codeLines = installerLines
     .map((line, index) => {
-      // Strip comments (naive # on non-quoted prefix is sufficient here:
-      // install.sh uses full-line comments only; inline trailing comments in
-      // quoted printf text are excluded by the printf filter below).
+      // Ignore full-line shell comments; printed text is filtered separately.
       const stripped = line.replace(/(^|\s)#.*$/, "$1")
       return { line: stripped, index }
     })
@@ -242,11 +293,7 @@ try {
     .map((entry) => entry.line.trim())
     .filter((trimmed) => {
       if (trimmed === "") return false
-      // printf lines PRINT systemctl text — that is the approved design.
       if (/printf/.test(trimmed)) return false
-      // Availability/version PROBES execute nothing: `command -v systemctl`
-      // only checks the binary exists; `systemctl --version` reads the
-      // version for the Type=notify gate. Neither enables/starts anything.
       if (/command\s+-v\s+systemctl/.test(trimmed) || /systemctl\s+--version/.test(trimmed)) return false
       return /systemctl|loginctl/.test(trimmed)
     })
@@ -261,7 +308,6 @@ try {
     "install.sh executes non-daemon-reload systemctl/loginctl commands.",
   )
 
-  // 6. Headless daemon mode answers loopback with the SPACED project anchored.
   const gui = spawn(installedExe, ["gui", "--project", spacedProject, "--server", "--no-open", "--port", port], {
     detached: true,
     stdio: "ignore",
@@ -283,14 +329,17 @@ try {
     }
   }
   check(workspaceOk, `GUI did not answer at http://127.0.0.1:${port}/api/workspace within 30s.`)
+  const capabilities = await (await fetch(`http://127.0.0.1:${port}/api/capabilities`)).json()
+  check(
+    capabilities.ok === true && capabilities.data?.version === packageVersion,
+    "Installed Linux GUI backend does not report the current release version.",
+  )
   check(!existsSync(join(root, "extract", ".opencomms")), "GUI created state inside the extraction dir.")
   check(!existsSync(join(payloadDir, ".opencomms")), "GUI created state inside the payload dir.")
 
-  // 7. Graceful SIGTERM.
   stopSmokeGui()
   check(readFileSync(projectState, "utf8") === preservedState, "GUI smoke modified the project .opencomms state.")
 
-  // 8. Uninstall prints instructions and removes binary + unit; state untouched.
   execFileSync(join(payloadDir, "install.sh"), ["--uninstall"], {
     env: { ...process.env, HOME: homeDir, XDG_CONFIG_HOME: configDir },
     stdio: "pipe",
@@ -299,14 +348,9 @@ try {
   check(!existsSync(unitFile), "Uninstall left the unit behind.")
   check(readFileSync(projectState, "utf8") === preservedState, "Uninstall modified project .opencomms state.")
 
-  // 9. Installer regression suite (Workstream L acceptance list; Linux-only).
-  // Exercises the v2 flow in --exe mode (no network): idempotency, PATH
-  // no-dup, rollback, state preservation, downgrade-guard parse tolerance.
   const regBinDir = join(homeDir, ".local", "bin")
-  const regExe = installedExe // re-installed below from the payload copy
+  const regExe = installedExe
 
-  // 9a. State preservation across a re-install (update path): a preserved
-  // project state file must remain byte-identical when the binary is replaced.
   const regProject = join(root, "Update Project")
   mkdirSync(join(regProject, ".opencomms"), { recursive: true })
   const regState = join(regProject, ".opencomms", "state.json")
@@ -317,8 +361,6 @@ try {
   })
   check(existsSync(regExe), "Re-install did not restore the binary (9a precondition).")
 
-  // 9b. Idempotency: a second install over the same target succeeds and
-  // leaves exactly one binary (no .opencomms-new/.opencomms-prev leftovers).
   execFileSync(join(payloadDir, "install.sh"), ["--exe", exe, "--bin-dir", binDir, "--no-path-edit"], {
     env: { ...process.env, HOME: homeDir, XDG_CONFIG_HOME: configDir },
     stdio: "pipe",
@@ -334,8 +376,6 @@ try {
     "Re-installed binary does not answer version (idempotency).",
   )
 
-  // 9c. PATH no-dup: profile line appears EXACTLY once after two installs
-  // that each request PATH handling.
   const profile = join(homeDir, ".profile")
   rmSync(profile, { force: true })
   execFileSync(join(payloadDir, "install.sh"), ["--exe", exe, "--bin-dir", binDir], {
@@ -354,8 +394,6 @@ try {
     `~/.profile has ${secondCount} PATH entries after second install, expected 1 (no duplicate appends).`,
   )
 
-  // 9d. Rollback: a DEFECTIVE staged binary must be refused before install.
-  // (execute-before-install) — simulate by passing a non-executable file.
   const defective = join(homeDir, "defective-opencomms")
   writeFileSync(defective, "#!/bin/sh\nexit 1\n", "utf8")
   chmodSync(defective, 0o755)
@@ -375,22 +413,20 @@ try {
   )
   rmSync(defective, { force: true })
 
-  // 9e. State preservation: update-path re-install never touched project state.
   check(readFileSync(regState, "utf8") === preservedState, "Re-install modified project .opencomms state.")
 
-  // 9f. Uninstall-after-regressions leaves nothing behind.
   execFileSync(join(payloadDir, "install.sh"), ["--uninstall"], {
     env: { ...process.env, HOME: homeDir, XDG_CONFIG_HOME: configDir },
     stdio: "pipe",
   })
   check(!existsSync(regExe), "Uninstall (post-regression) left the binary behind.")
 
+  verifyDownloadChecksums(join(payloadDir, "install.sh"))
+
   console.log(
-    "[opencomms-linux-release] extraction, checksums, exe smoke, unit quoting, headless GUI, SIGTERM, installer regressions, and uninstall passed",
+    "[opencomms-linux-release] extraction, checksums, current artifact identity, GUI, installer regressions, applicable download checksum entries, and uninstall passed",
   )
 } catch (error) {
-  // Any non-check() failure (execFileSync exit, fs error) is annotated too —
-  // every failure path in this smoke test must be observable anonymously.
   console.log(
     `::error file=scripts/test-linux-release.mjs::${String(error.message ?? error)
       .replaceAll("\n", " ")

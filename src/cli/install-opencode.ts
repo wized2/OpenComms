@@ -1,19 +1,6 @@
 /**
- * De-repo'd OpenCode plugin installer (SEA fix, 2026-09-11).
- *
- * The old CLI dispatched `opencomms install opencode` by locating the
- * repo's install.mjs — impossible for the standalone exe (no repo) and the
- * source of the "Unknown command <cwd>\install.mjs" misparse (Platform
- * repro). The install logic now lives HERE, bundled with the CLI:
- *
- *   1. Plugin source: under the packaged exe the plugin bundle is EMBEDDED
- *      (SEA asset placeholder replaced at build time — see
- *      scripts/build-exe.mjs); in development it is <repo>/dist/plugin.bundled.js.
- *   2. Copy to <target>/.opencode/plugins/plugin.js.
- *   3. Patch <target>/opencode.json(.jsonc) "plugin" array (idempotent).
- *
- * Never runs a build, never touches the repo, never resolves anything from
- * CWD (only the TARGET PROJECT dir, which is the documented default).
+ * Install the embedded SEA plugin or development bundle into a target project.
+ * Resource lookup uses module/binary anchors, never the target project's CWD.
  */
 
 import { existsSync, mkdirSync, writeFileSync, unlinkSync, readFileSync } from "node:fs"
@@ -23,21 +10,21 @@ import { pluginBundlePath } from "./paths.js"
 export interface OpencodeInstallOutcome {
   ok: boolean
   lines: string[]
+  /** Adapters use structured fields; human-readable lines are not an API. */
+  pluginRelPath?: string
+  configPath?: string
+  /** plugin.js was written this run (false = already identical/registered). */
+  wrotePlugin?: boolean
+  /** opencode.json(.jsonc) "plugin" array now contains our entry. */
+  pluginRegistered?: boolean
+  /** true when plugin.js existed but was NOT the registered OpenComms entry
+   *  before this run (possible foreign plugin — surfaced as a warning). */
+  preExistingForeignPlugin?: boolean
 }
 
-/**
- * SEA asset placeholder: build-exe.mjs injects the real plugin bundle as a
- * SEA asset named by this key. When running under the exe the asset is read
- * via node:sea getAsset; in development we read the repo dist file. The
- * placeholder constant is also what lets the unit tests assert the
- * build-time wiring exists.
- */
+/** build-exe.mjs embeds the plugin bundle under this SEA asset key. */
 export const PLUGIN_BUNDLE_PLACEHOLDER = "opencode-plugin-bundle"
 
-/**
- * Read the plugin bundle contents. Throws with an actionable message when
- * neither source is present (dev: run npm run build).
- */
 export function readPluginBundle(opts: { sea: boolean; execPath: string; anchorDir: string | null }): string | null {
   if (!opts.sea) {
     const found = pluginBundlePath(opts)
@@ -66,11 +53,53 @@ function readConfigText(path: string): string | null {
   return readFileSync(path, "utf8")
 }
 
-/** Strip comments ONLY for .jsonc (naive // stripping corrupts URLs in .json). */
+/** Strip JSONC comments outside strings, preserving escaped quotes and URLs. */
+export function stripJsoncComments(raw: string): string {
+  let out = ""
+  let i = 0
+  let inString = false
+  while (i < raw.length) {
+    const ch = raw[i]!
+    if (inString) {
+      out += ch
+      if (ch === "\\") {
+        const next = raw[i + 1]
+        if (next !== undefined) {
+          out += next
+          i += 2
+          continue
+        }
+      } else if (ch === '"') {
+        inString = false
+      }
+      i += 1
+      continue
+    }
+    if (ch === '"') {
+      inString = true
+      out += ch
+      i += 1
+      continue
+    }
+    if (ch === "/" && raw[i + 1] === "/") {
+      while (i < raw.length && raw[i] !== "\n") i += 1
+      continue
+    }
+    if (ch === "/" && raw[i + 1] === "*") {
+      const end = raw.indexOf("*/", i + 2)
+      i = end === -1 ? raw.length : end + 2
+      continue
+    }
+    out += ch
+    i += 1
+  }
+  return out
+}
+
 function parseConfig(path: string, raw: string): { config?: Record<string, unknown>; error?: string } {
   let text = raw
   if (path.endsWith(".jsonc")) {
-    text = text.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "")
+    text = stripJsoncComments(text)
   }
   try {
     return { config: JSON.parse(text) as Record<string, unknown> }
@@ -79,12 +108,6 @@ function parseConfig(path: string, raw: string): { config?: Record<string, unkno
   }
 }
 
-/**
- * Install the OpenComms plugin into a target project. Works identically
- * from the standalone exe (embedded asset) and from a dev checkout (dist
- * bundle). No repo access, no build, no CWD dependence beyond the default
- * target resolution the caller documents.
- */
 export function opencodeInstallReport(opts: {
   targetProject: string
   sea: boolean
@@ -105,6 +128,10 @@ export function opencodeInstallReport(opts: {
           ? "The packaged exe should carry the embedded plugin; rebuild with npm run build:exe."
           : "dist/plugin.bundled.js missing — run `npm run build` first.",
       ],
+      pluginRelPath: ".opencode/plugins/plugin.js",
+      wrotePlugin: false,
+      pluginRegistered: false,
+      preExistingForeignPlugin: false,
     }
   }
 
@@ -121,23 +148,36 @@ export function opencodeInstallReport(opts: {
     }
   }
   const pluginFile = join(pluginsDir, "plugin.js")
+  // Report an existing foreign plugin before overwriting the OpenComms-owned path.
+  const preExistingForeignPlugin = existsSync(pluginFile) && !readFileSync(pluginFile, "utf8").includes("opencomms")
   writeFileSync(pluginFile, contents, "utf8")
   lines.push(`wrote .opencode/plugins/plugin.js (self-contained)`)
+  if (preExistingForeignPlugin) {
+    lines.push(
+      "WARNING: .opencode/plugins/plugin.js existed but was not an OpenComms plugin; it was replaced. Restore it from version control if it was yours.",
+    )
+  }
 
-  // Patch opencode.json (or .jsonc) — same behavior as the legacy install.mjs.
   const jsonCandidates = [join(target, "opencode.json"), join(target, "opencode.jsonc")]
   const existing = jsonCandidates.find((p) => existsSync(p))
   const configPath = existing ?? jsonCandidates[0] ?? join(target, "opencode.json")
   const pluginRelPath = ".opencode/plugins/plugin.js"
   if (!configPath) {
     lines.push("could not determine opencode.json path")
-    return { ok: false, lines }
+    return { ok: false, lines, pluginRelPath, wrotePlugin: true, pluginRegistered: false, preExistingForeignPlugin }
   }
   const raw = readConfigText(configPath)
   if (raw !== null) {
     const parsed = parseConfig(configPath, raw)
     if (parsed.error) {
-      return { ok: false, lines: [parsed.error] }
+      return {
+        ok: false,
+        lines: [parsed.error],
+        pluginRelPath,
+        wrotePlugin: true,
+        pluginRegistered: false,
+        preExistingForeignPlugin,
+      }
     }
     const config = parsed.config as Record<string, unknown>
     const pluginField = config["plugin"]
@@ -147,7 +187,7 @@ export function opencodeInstallReport(opts: {
     else if (Array.isArray(pluginField)) arr = [...pluginField]
     else {
       lines.push('opencode.json "plugin" field is not a string or array; refusing to overwrite.')
-      return { ok: false, lines }
+      return { ok: false, lines, pluginRelPath, wrotePlugin: true, pluginRegistered: false, preExistingForeignPlugin }
     }
     const already = arr.some((entry) => entry === pluginRelPath || (Array.isArray(entry) && entry[0] === pluginRelPath))
     if (!already) arr.push(pluginRelPath)
@@ -160,5 +200,13 @@ export function opencodeInstallReport(opts: {
   }
 
   lines.push("Done. Open OpenCode in the target project and run /OpenComms Create ... in a session.")
-  return { ok: true, lines }
+  return {
+    ok: true,
+    lines,
+    pluginRelPath,
+    configPath: configPath.replace(/\\/g, "/"),
+    wrotePlugin: true,
+    pluginRegistered: true,
+    preExistingForeignPlugin,
+  }
 }

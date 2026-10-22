@@ -1,24 +1,9 @@
-﻿/**
- * Shared OpenComms CLI.
- *
- * Commands:
- *   opencomms status [project]        - channels/members/queues for a project
- *   opencomms channels [project]      - channel summaries only
- *   opencomms members <channel> ...   - member roster for one channel
- *   opencomms install opencode ...    - per-host installer
- *   opencomms install-member ...      - pin a member for hooks (identity file)
- *   opencomms uninstall <host> ...    - remove OpenComms integration
- *   opencomms doctor [project]        - detection + capability report
- *   opencomms version                 - version information
- *
- * Never prints secrets (env values, pin contents are summarized, not dumped).
- */
+﻿/** Shared CLI entry point. Diagnostics summarize identities and never print secrets. */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "node:fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, unlinkSync, statSync } from "node:fs"
 import { join, resolve, dirname } from "node:path"
 import { tmpdir } from "node:os"
 import { execFileSync, spawn, spawnSync } from "node:child_process"
-import { randomBytes } from "node:crypto"
 import { isSea } from "node:sea"
 import { installClaudeCode, registerProjectMember } from "../adapters/claude-code/install.js"
 import { installCodex, detectCodex } from "../adapters/codex/install.js"
@@ -37,11 +22,23 @@ import { WIZARD_PS1 } from "./wizard.js"
 import { iconIcoBytes } from "./icon-base64.js"
 import { updateCommand } from "./update.js"
 import { runAgentCommand } from "./agent.js"
-import { taskList, taskAssign, membersRemove, sessionCreate } from "./tasks.js"
+import {
+  taskList,
+  taskAssign,
+  taskShow,
+  taskTransition,
+  taskReassign,
+  taskContext,
+  membersRemove,
+  sessionCreate,
+} from "./tasks.js"
 import { VERSION } from "../version.js"
+import { doctorReport } from "./doctor.js"
 import { runBridge } from "../orchestrator/bridge.js"
+import { createDefaultManager } from "../integrations/registry.js"
+import { sharedMcpBundleInUse } from "../integrations/shared-artifacts.js"
+import { createMcpProfile, MCP_PROFILE_HOSTS } from "../integrations/mcp-profiles.js"
 
-/** Package version, derived from package.json so the CLI can never drift. */
 function flagValue(tokens: string[], name: string): string | undefined {
   const idx = tokens.indexOf(name)
   return idx >= 0 ? tokens[idx + 1] : undefined
@@ -52,18 +49,10 @@ function projectDirFromFlag(tokens: string[], name: string): string | undefined 
   return value ? resolve(value) : undefined
 }
 
-/**
- * SEA path architecture (docs/adr-sea-path-resolution.md): the five
- * locations are separated by src/cli/paths.ts. The CLI is invoked either as
- * the SEA exe (isSea) or under node with import.meta available; CWD is used
- * ONLY as the default TARGET PROJECT dir, never for resources.
- */
 import { opencodeInstallReport } from "./install-opencode.js"
 
-/** Module anchor for development resolution (import.meta works in ESM dist). */
 const moduleAnchor: string | null = (() => {
   try {
-    // ESM dist (node dist/cli/main.js): import.meta.dirname exists.
     const dir = import.meta.dirname
     return dir ?? null
   } catch {
@@ -172,7 +161,6 @@ function fmtDoctor(projectDir: string): CliResult {
   lines.push(`OpenComms doctor (v${VERSION})`)
   lines.push("")
 
-  // State health.
   const store = new StateStore(resolve(projectDir))
   const state = store.load()
   lines.push(`State: .opencomms/state.json (schema v${state.schema_version})`)
@@ -182,7 +170,6 @@ function fmtDoctor(projectDir: string): CliResult {
   const migrationError = state.errors.find((e) => e.message.includes("Migrated") || e.message.includes("Legacy"))
   if (migrationError) lines.push(`  ${migrationError.message.slice(0, 120)}`)
 
-  // Hosts.
   lines.push("")
   lines.push("Hosts:")
   const claudeCode = existsSync(join(resolve(projectDir), ".mcp.json"))
@@ -204,7 +191,6 @@ function fmtDoctor(projectDir: string): CliResult {
     `  ChatGPT Desktop: not directly detectable (${gpt.detected ? "?" : "by design; no documented API"}) | remote MCP scaffold: ${existsSync(join(resolve(projectDir), "opencomms-chatgpt")) ? "scaffolded" : "not scaffolded"}`,
   )
 
-  // Member pins.
   lines.push("")
   const pins = listMemberPins(resolve(projectDir))
   if (pins.length > 0) {
@@ -218,8 +204,6 @@ function fmtDoctor(projectDir: string): CliResult {
     )
   }
 
-  // M3 node readiness (Platform): runtime discovery + node-mode detection.
-  // G5: PATH-convention discovery with the nvm/fnm-on-systemd-PATH warning.
   lines.push("")
   lines.push("Node readiness (M3 remote-node daemon):")
   const nodeBinary = resolveDaemonRuntimeNode()
@@ -245,11 +229,30 @@ function fmtDoctor(projectDir: string): CliResult {
   return ok(lines.join("\n"))
 }
 
-/**
- * G5 Linux runtime discovery for the daemon: where does `node` resolve
- * from, and is it a nvm/fnm-managed shim (which is NOT on a systemd unit's
- * PATH unless explicitly added)? Honest about the discovery mechanism.
- */
+export async function doctorCommand(projectDir: string, fix: boolean): Promise<CliResult> {
+  const report = await doctorReport(projectDir, { fix })
+  const lines: string[] = []
+  lines.push(`OpenComms doctor (v${VERSION})${fix ? " --fix" : ""}`)
+  for (const check of report.checks) {
+    const mark = check.status === "ok" ? "OK  " : check.status === "warn" ? "WARN" : "FAIL"
+    lines.push(`  [${mark}] ${check.label}: ${check.detail}`)
+  }
+  if (report.fixed.length > 0) {
+    lines.push("")
+    lines.push("Fixed:")
+    for (const f of report.fixed) lines.push(`  + ${f}`)
+  }
+  if (report.unfixable.length > 0) {
+    lines.push("")
+    lines.push("Needs manual attention:")
+    for (const u of report.unfixable) lines.push(`  ! ${u}`)
+  }
+  lines.push("")
+  lines.push(report.ok ? "Doctor: no failures." : "Doctor: failures present (see [FAIL] rows above).")
+  return report.ok ? ok(lines.join("\n")) : fail(lines.join("\n"))
+}
+
+/** Flag version-manager shims that will not appear on a systemd unit's PATH. */
 function resolveDaemonRuntimeNode(): { found: boolean; source: string; warning?: string } {
   const isWindows = process.platform === "win32"
   const envPath = process.env["PATH"] ?? ""
@@ -291,15 +294,12 @@ function detectWsl(): { available: boolean; detail: string } {
   }
 }
 
-/** opencomms install <host> [project] */
 function runInstall(host: string | undefined, projectDir: string): CliResult {
   switch ((host ?? "").toLowerCase()) {
+    case "gemini-cli": {
+      return fail("Gemini installation uses the async integration manager (CLI main handles this).")
+    }
     case "opencode": {
-      // De-repo'd (SEA fix): bundled install logic, embedded plugin asset
-      // under the exe, dist bundle in development — never install.mjs, never
-      // CWD-relative resource resolution. A standalone exe without the asset
-      // fails with a CLEAR early message (gate-2 option b), never a
-      // wrong-path exec.
       const report = opencodeInstallReport({
         targetProject: projectDir,
         sea: seaMode(),
@@ -350,16 +350,21 @@ function runInstall(host: string | undefined, projectDir: string): CliResult {
       )
     }
     default:
-      return fail(`Unknown host "${host ?? ""}". Supported: opencode, claude-code, claude-desktop, codex, chatgpt.`)
+      return fail(
+        `Unknown host "${host ?? ""}". Supported: opencode, claude-code, claude-desktop, codex, chatgpt, gemini-cli.`,
+      )
   }
 }
 
-/** opencomms uninstall <host> [project] */
 function runUninstall(host: string | undefined, projectDir: string): CliResult {
   switch ((host ?? "").toLowerCase()) {
+    case "gemini-cli": {
+      return fail("Gemini uninstall uses the async integration manager (CLI main handles this).")
+    }
     case "claude-code": {
       // Remove ONLY OpenComms entries; never touch unrelated config.
-      const settingsPath = join(resolve(projectDir), ".claude", "settings.json")
+      const target = resolve(projectDir)
+      const settingsPath = join(target, ".claude", "settings.json")
       let removed = false
       if (existsSync(settingsPath)) {
         const raw = JSON.parse(readFileSync(settingsPath, "utf8")) as { hooks?: Record<string, unknown> }
@@ -376,29 +381,81 @@ function runUninstall(host: string | undefined, projectDir: string): CliResult {
               }
             }
           }
-          // Write only when something was actually removed (no format churn).
+          for (const event of Object.keys(raw.hooks)) {
+            if (Array.isArray(raw.hooks[event]) && (raw.hooks[event] as unknown[]).length === 0) {
+              delete raw.hooks[event]
+              changedAny = true
+            }
+          }
+          if (Object.keys(raw.hooks).length === 0) delete raw.hooks
           if (changedAny) writeFileSync(settingsPath, JSON.stringify(raw, null, 2) + "\n", "utf8")
+        }
+      }
+      const mcpJsonPath = join(target, ".mcp.json")
+      if (existsSync(mcpJsonPath)) {
+        const mcpConfig = JSON.parse(readFileSync(mcpJsonPath, "utf8")) as { mcpServers?: Record<string, unknown> }
+        if (mcpConfig.mcpServers && "opencomms" in mcpConfig.mcpServers) {
+          delete mcpConfig.mcpServers["opencomms"]
+          if (Object.keys(mcpConfig.mcpServers).length === 0) delete mcpConfig.mcpServers
+          writeFileSync(mcpJsonPath, JSON.stringify(mcpConfig, null, 2) + "\n", "utf8")
+          removed = true
+        }
+      }
+      for (const bundle of ["claude-code-hooks.mjs", "opencomms-mcp.mjs"]) {
+        if (bundle === "opencomms-mcp.mjs" && sharedMcpBundleInUse(target, "claude-code")) continue
+        const bundlePath = join(target, ".opencomms", bundle)
+        if (existsSync(bundlePath)) {
+          try {
+            unlinkSync(bundlePath)
+            removed = true
+          } catch {
+            /* best effort; report continues */
+          }
         }
       }
       return ok(
         removed
-          ? "OpenComms hooks removed from .claude/settings.json (other config untouched)."
-          : "No OpenComms hooks found (nothing to remove).",
+          ? "OpenComms integration removed (hooks, .mcp.json entry, copied bundles). Other config untouched. NOTE: .opencomms/state.json and pins are shared project state and were NOT removed."
+          : "No OpenComms integration found (nothing to remove).",
       )
     }
     case "codex": {
+      // Remove server headers and their nested env tables together.
       const configPath = join(resolve(projectDir), ".codex", "config.toml")
       if (!existsSync(configPath)) return ok("No Codex config present.")
       const toml = readFileSync(configPath, "utf8")
-      const sectionStart = toml.indexOf("[mcp_servers.opencomms]")
-      if (sectionStart === -1) return ok("No opencomms section in config.toml.")
-      // Cut from the section to the next top-level [section] after it.
-      const rest = toml.slice(sectionStart)
-      const nextSection = rest.slice(1).search(/\n\[/)
-      const end = nextSection === -1 ? rest.length : 1 + nextSection + 1
-      const cleaned = (toml.slice(0, sectionStart) + rest.slice(end)).replace(/\n{3,}/g, "\n\n")
-      writeFileSync(configPath, cleaned, "utf8")
-      return ok("[mcp_servers.opencomms] removed from .codex/config.toml (other sections untouched).")
+      const sectionRe = /^\[mcp_servers\.opencomms(?:\.[^\]]*)?\]$/gm
+      if (!sectionRe.test(toml)) return ok("No opencomms section in config.toml.")
+      sectionRe.lastIndex = 0
+      const cuts: Array<[number, number]> = []
+      for (let m = sectionRe.exec(toml); m !== null; m = sectionRe.exec(toml)) {
+        const start = m.index
+        const afterHeader = toml.indexOf("\n[", start + 1)
+        // Find the next section header that is NOT an opencomms sub-table.
+        let end = toml.length
+        let cursor = afterHeader
+        while (cursor !== -1) {
+          const lineEnd = toml.indexOf("\n", cursor + 1)
+          const line = toml.slice(cursor + 1, lineEnd === -1 ? toml.length : lineEnd).trim()
+          if (/^\[mcp_servers\.opencomms(?:\.[^\]]*)?\]$/.test(line)) {
+            cursor = toml.indexOf("\n[", cursor + 1)
+            continue
+          }
+          end = cursor === -1 ? toml.length : cursor + 1
+          break
+        }
+        cuts.push([start, end])
+      }
+      let cleaned = toml
+      for (let i = cuts.length - 1; i >= 0; i--) {
+        const [start, end] = cuts[i]!
+        cleaned = cleaned.slice(0, start) + cleaned.slice(end)
+      }
+      cleaned = cleaned.replace(/\n{3,}/g, "\n\n")
+      if (cleaned !== toml) writeFileSync(configPath, cleaned, "utf8")
+      return ok(
+        "[mcp_servers.opencomms] (incl. env sub-table) removed from .codex/config.toml (other sections untouched).",
+      )
     }
     case "claude-desktop":
       return ok(
@@ -415,7 +472,6 @@ function runUninstall(host: string | undefined, projectDir: string): CliResult {
   }
 }
 
-/** opencomms install-member [--host <host>] [--id <memberId> | --name <name>] */
 function runInstallMember(projectDir: string, host: string | undefined, memberId: string | null): CliResult {
   const result = registerProjectMember(resolve(projectDir), {
     host: host ?? "claude-code",
@@ -427,15 +483,9 @@ function runInstallMember(projectDir: string, host: string | undefined, memberId
   )
 }
 
-/**
- * Session lifecycle commands (operator backend surface, work order
- * 2026-09-08): list / get / save / delete / resume. Provider-independent —
- * operates directly on project state + archives.
- */
 function runSession(tokens: string[], projectDir: string): Promise<CliResult> {
   const sub = (tokens[0] ?? "list").toLowerCase()
   const rest = tokens.slice(1)
-  // First non-flag token after the subcommand is the session name.
   let name: string | undefined
   for (let i = 0; i < rest.length; i++) {
     const t = rest[i]!
@@ -588,22 +638,14 @@ function runSession(tokens: string[], projectDir: string): Promise<CliResult> {
   return run().catch((error: Error) => fail(`Session command failed: ${error.message}`))
 }
 
-/**
- * Print the REAL, currently-valid join command for a session on a given
- * host (work order: the GUI shows this; users never copy UUIDs).
- */
-function runJoinCommand(projectDir: string, sessionName: string | undefined, host: string | undefined): CliResult {
-  // Shared helper keeps CLI and GUI on ONE definition of the real command.
+function runJoinCommand(sessionName: string | undefined, host: string | undefined): CliResult {
   if (!sessionName) return fail("Usage: opencomms join-command <session> [--host <opencode|claude-code|codex>]")
   const result = joinCommandFor(sessionName, host ?? "opencode")
   if ("error" in result) return fail(result.error)
   return ok(`Run ${result.where}:\n  ${result.command}`)
 }
 
-/**
- * `opencomms gui` — start the loopback-only local console (blocks until
- * Ctrl+C). No network exposure; no provider credentials pass through.
- */
+/** Loopback-only console; provider credentials never pass through it. */
 function appendInstallerLog(message: string): void {
   try {
     const file = join(workspaceConfigDir(), "logs", "installer.log")
@@ -649,14 +691,20 @@ function startGui(projectDir: string | undefined, portFlag: string | undefined, 
 }
 
 /** Start the GUI-backed stdio bridge used by the native Tauri shell. */
-async function startBridge(projectDir: string): Promise<void> {
-  const handle = await startGuiServer({ projectDir, port: 0, hostname: "127.0.0.1" })
+async function startBridge(projectDir: string, bootstrap = false): Promise<void> {
+  const handle = await startGuiServer({
+    projectDir: bootstrap ? undefined : projectDir,
+    bridgeStorageDir: bootstrap ? projectDir : undefined,
+    port: 0,
+    hostname: "127.0.0.1",
+  })
   try {
     const coreDeps = handle.bridgeDeps()
     if (!coreDeps) throw new Error("OpenComms bridge requires a selected project.")
     await runBridge(
       {
         ...coreDeps,
+        getCoreDeps: handle.bridgeDeps,
         write: (line) => process.stdout.write(line + "\n"),
         error: (message) => process.stderr.write(message + "\n"),
       },
@@ -667,21 +715,11 @@ async function startBridge(projectDir: string): Promise<void> {
   }
 }
 
-/**
- * True when this process runs as the packaged standalone exe (Node SEA):
- * the double-click case has NO argv[1], the explicit-command case has
- * argv[1] === execPath. Under plain `node`, argv[1] is a script path.
- */
 export function runningAsPackagedExe(): boolean {
   return isSea()
 }
 
-/**
- * Identify the CLI entry point without assuming that a SEA process has a
- * script path. Node SEA uses no argv[1] for a double-click launch and may use
- * the executable itself for an explicit command; regular Node imports use a
- * real script path and must not execute the CLI side effect.
- */
+/** Imports must not dispatch the CLI; SEA launches may omit argv[1] or use the executable path. */
 export function isCliEntryPoint(
   invoked: string,
   argv1: string | undefined,
@@ -694,11 +732,7 @@ export function isCliEntryPoint(
   )
 }
 
-/**
- * Double-click behavior (spec: the exe must DO something visible): with no
- * arguments on a Windows console, launch the install wizard instead of
- * flashing help text. Escapes: OPENCOMMS_NO_WIZARD=1, or any argument.
- */
+/** Windows double-click launches the installer unless OPENCOMMS_NO_WIZARD=1. */
 function shouldLaunchWizard(argv: string[]): boolean {
   return (
     process.platform === "win32" &&
@@ -708,12 +742,7 @@ function shouldLaunchWizard(argv: string[]): boolean {
   )
 }
 
-/**
- * Launch the PowerShell/WinForms install wizard as a DETACHED process (the
- * exe exits right away; the wizard window is independent). The script is
- * passed via -EncodedCommand so no temp .ps1 file and no execution-policy
- * change is needed; the exe + icon paths travel via env defaults.
- */
+/** Detach the wizard and pass paths via env; -EncodedCommand needs no temporary script. */
 function launchWizard(): CliResult {
   if (process.platform !== "win32") {
     return fail(
@@ -758,11 +787,7 @@ function launchWizard(): CliResult {
   return ok("Installer wizard launched (a setup window will open shortly).")
 }
 
-/**
- * `opencomms uninstall-self` — remove the installed integration: user PATH
- * entry, Start Menu shortcuts, desktop shortcut, then delete the install
- * directory once this process has exited (detached delayed cleanup).
- */
+/** Remove installed files after this process exits to avoid Windows executable locks. */
 function runUninstallSelf(): CliResult {
   if (process.platform !== "win32") {
     return fail("uninstall-self is Windows-only. On macOS/Linux remove the binary from ~/.local/bin manually.")
@@ -781,7 +806,6 @@ function runUninstallSelf(): CliResult {
   if (result.status !== 0) {
     return fail(`Uninstall failed (status ${result.status}):\n${output}`)
   }
-  // Schedule removal of the install dir once this process has exited.
   try {
     const cleaner = spawn("cmd.exe", ["/c", `ping -n 3 127.0.0.1 > nul & rmdir /s /q "${installDir}"`], {
       detached: true,
@@ -803,13 +827,11 @@ export function runCli(argv: string[]): CliResult {
   const cmd = tokens[0]
   const explicitProjectDir = projectDirFromFlag(tokens, "--project")
   const projectDir = explicitProjectDir ?? process.cwd()
-  // The positional (host/channel name) = first token after the command that
-  // is not a flag or a flag value.
   let positional: string | undefined
   for (let i = 1; i < tokens.length; i++) {
     const t = tokens[i]!
     if (t === "--project") {
-      i++ // skip its value
+      i++
       continue
     }
     if (positional === undefined) positional = t
@@ -822,14 +844,40 @@ export function runCli(argv: string[]): CliResult {
     case "members":
       return fmtMembers(projectDir, positional)
     case "doctor":
+      // doctor --fix needs the async state lock; plain doctor is read-only.
+      if (tokens.includes("--fix")) {
+        return fail("Doctor --fix is async: await doctorCommand(...) (CLI main handles this).")
+      }
       return fmtDoctor(projectDir)
     case "version":
       return ok(`opencomms ${VERSION} (state schema v${SCHEMA_VERSION})`)
     case "update":
-      // Async (network): handled on the async path below, like session.
       return fail("Update commands are async: await updateCommand(...) (CLI main handles this).")
     case "install":
       return runInstall(positional, projectDir)
+    case "mcp-profile": {
+      const memberId = flagValue(tokens, "--id")
+      if (!memberId)
+        return fail("MCP profile requires --id <OpenComms-member-id>; native conversation identity is unknown.")
+      const serverPath = resolve(flagValue(tokens, "--server") ?? join(projectDir, ".opencomms/opencomms-mcp.mjs"))
+      if (!existsSync(serverPath) || !statSync(serverPath).isFile())
+        return fail(
+          "Standalone MCP bundle is missing. Pass --server <installed bundle or npm dist/mcp/main.js>; no configuration was changed.",
+        )
+      try {
+        return ok(
+          createMcpProfile({
+            host: positional ?? "",
+            projectDir,
+            memberId,
+            serverPath,
+            nodeCommand: flagValue(tokens, "--node"),
+          }).content.trimEnd(),
+        )
+      } catch (error) {
+        return fail(error instanceof Error ? error.message : "MCP profile could not be generated.")
+      }
+    }
     case "gui":
       return startGui(
         explicitProjectDir,
@@ -845,16 +893,13 @@ export function runCli(argv: string[]): CliResult {
     case "session":
       return fail('Session commands are async: await runSession(["save", "<name>"]) (CLI main handles this).')
     case "agent":
-      // Async (loopback HTTP): handled on the async path below.
       return fail("Agent commands are async: await runAgentCommand(...) (CLI main handles this).")
     case "task":
-    case "members":
     case "serve":
-      // Async (loopback HTTP / thin alias): handled on the async path below.
       return fail("Task/member/serve commands are async: see the async dispatch in the CLI entry (main handles this).")
     case "join-command":
     case "join":
-      return runJoinCommand(projectDir, positional, flagValue(tokens, "--host"))
+      return runJoinCommand(positional, flagValue(tokens, "--host"))
     case "install-member":
       return runInstallMember(
         projectDir,
@@ -872,9 +917,10 @@ export function runCli(argv: string[]): CliResult {
           "  opencomms status [--project <dir>]",
           "  opencomms channels [--project <dir>]",
           "  opencomms members <channel> [--project <dir>]",
-          "  opencomms doctor [--project <dir>]",
-          "  opencomms install <opencode|claude-code|claude-desktop|codex|chatgpt> [--project <dir>]",
+          "  opencomms doctor [--project <dir>] [--fix]   # --fix repairs safe, understood problems",
+          "  opencomms install <opencode|claude-code|claude-desktop|codex|chatgpt|gemini-cli> [--project <dir>]",
           "  opencomms install-member [--host <id>] [--id <memberId> | --name <name>] [--project <dir>]",
+          `  opencomms mcp-profile <${MCP_PROFILE_HOSTS.join("|")}> --id <member> [--project <dir>] [--server <bundle>] [--node <executable>]  # read-only config export`,
           "  opencomms session <list|get|save|delete|resume> [name] [--summary ...] [--as name] [--confirm]",
           "  opencomms gui [--project <dir>] [--port <port>] [--server]  # embedded HTML console",
           "  opencomms bridge [--project <dir>]  # native GUI stdio sidecar",
@@ -892,8 +938,6 @@ export function runCli(argv: string[]): CliResult {
   }
 }
 
-// CLI invocation only (not when imported by tests). Under a Node SEA
-// single executable, process.execPath IS the CLI itself (argv[1] = exe).
 import { realpathSync } from "node:fs"
 const invoked = process.argv[1] ? realpathSync(process.argv[1]).replace(/\\/g, "/") : ""
 const isCliEntry = isCliEntryPoint(invoked, process.argv[1], process.execPath, runningAsPackagedExe())
@@ -905,15 +949,35 @@ if (isCliEntry) {
   const argv = process.argv.slice(2)
   if (shouldLaunchWizard(argv)) {
     emit(launchWizard())
+  } else if ((argv[0] === "install" || argv[0] === "uninstall") && argv[1] === "gemini-cli") {
+    const manager = createDefaultManager()
+    const context = {
+      projectDir: resolve(projectDirFromFlag(argv, "--project") ?? process.cwd()),
+      currentVersion: VERSION,
+    }
+    const operation =
+      argv[0] === "install" ? manager.install(context, "gemini-cli") : manager.uninstall(context, "gemini-cli")
+    void operation
+      .then((report) =>
+        emit({
+          code: report.ok ? 0 : 1,
+          output: [...report.actions, ...report.warnings.map((warning) => `! ${warning}`)].join("\n"),
+        }),
+      )
+      .catch((error: Error) => emit({ code: 1, output: `Gemini integration failed: ${error.message}` }))
   } else if (argv[0] === "gui") {
     // The GUI server blocks; never take the sync exit path.
     const guiResult = runCli(argv)
     if (guiResult.output) process.stdout.write(guiResult.output + "\n")
   } else if (argv[0] === "bridge") {
-    void startBridge(projectDirFromFlag(argv, "--project") ?? process.cwd()).catch((error: unknown) => {
-      process.stderr.write(`Bridge failed: ${(error as Error).message}\n`)
-      process.exitCode = 1
-    })
+    void startBridge(projectDirFromFlag(argv, "--project") ?? process.cwd(), argv.includes("--bootstrap")).catch(
+      (error: unknown) => {
+        process.stderr.write(`Bridge failed: ${(error as Error).message}\n`)
+        process.exitCode = 1
+      },
+    )
+  } else if (argv[0] === "doctor") {
+    void doctorCommand(projectDirFromFlag(argv, "--project") ?? process.cwd(), argv.includes("--fix")).then(emit)
   } else if (argv[0] === "session") {
     void runSession(argv.slice(1), projectDirFromFlag(argv, "--project") ?? process.cwd()).then(emit)
   } else if (argv[0] === "update") {
@@ -930,51 +994,25 @@ if (isCliEntry) {
       void taskList(argv.slice(2)).then(emit)
     } else if (sub === "assign") {
       void taskAssign(argv.slice(2)).then(emit)
+    } else if (sub === "show") {
+      void taskShow(argv.slice(2)).then(emit)
+    } else if (sub === "transition") {
+      void taskTransition(argv.slice(2)).then(emit)
+    } else if (sub === "reassign") {
+      void taskReassign(argv.slice(2)).then(emit)
+    } else if (sub === "context") {
+      void taskContext(argv.slice(2)).then(emit)
     } else {
-      emit({ code: 2, output: "Usage: opencomms task <list|assign> [--json] [...]" })
+      emit({ code: 2, output: "Usage: opencomms task <list|assign|show|transition|reassign|context> [--json] [...]" })
     }
   } else if (argv[0] === "members" && argv[1] === "remove") {
     void membersRemove(argv.slice(2)).then(emit)
   } else if (argv[0] === "session" && argv[1] === "create") {
     void sessionCreate(argv.slice(2)).then(emit)
   } else if (argv[0] === "serve") {
-    // Thin alias (M0 decision): systemd-friendly name for the daemon mode.
     argv[0] = "gui"
     const guiResult = runCli(argv)
     if (guiResult.output) process.stdout.write(guiResult.output + "\n")
-  } else if (argv[0] === "bridge") {
-    // M4.5: the native Tauri GUI's stdio JSON-RPC bridge. Speaks the
-    // handshake FIRST, then one request line -> one response line until
-    // stdin closes. Blocks (like gui); never takes the sync exit path.
-    const projectDir = projectDirFromFlag(argv, "--project") ?? initialWorkspaceProject()
-    const port = Number(flagValue(argv, "--port") ?? "4919")
-    void (async () => {
-      try {
-        const handle = await startGuiServer({
-          projectDir: projectDir ?? undefined,
-          port: Number.isFinite(port) && port > 0 ? port : 4919,
-          hostname: "127.0.0.1",
-        })
-        const coreDeps = handle.bridgeDeps()
-        if (!coreDeps) {
-          process.stderr.write("bridge: no project selected — set --project or open a project in the console first.\n")
-          await handle.close()
-          process.exitCode = 2
-          return
-        }
-        await runBridge(
-          {
-            ...coreDeps,
-            write: (line) => process.stdout.write(line + "\n"),
-            error: (m) => process.stderr.write(m + "\n"),
-          },
-          process.stdin,
-        )
-      } catch (error) {
-        process.stderr.write(`bridge failed: ${(error as Error).message}\n`)
-        process.exitCode = 1
-      }
-    })()
   } else {
     emit(runCli(argv))
   }

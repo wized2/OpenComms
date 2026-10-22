@@ -1,0 +1,10 @@
+/** Compatibility exports; new code uses the canonical registry directly. */
+export * from "./types.js"
+export * from "./versioning.js"
+export * from "./manager.js"
+export { createDefaultManager } from "./registry.js"
+export { opencodeAdapter } from "./adapters/opencode.js"
+export { claudeCodeAdapter } from "./adapters/claude-code.js"
+export { codexAdapter } from "./adapters/codex.js"
+export { claudeDesktopAdapter } from "./adapters/claude-desktop.js"
+export { chatgptAdapter } from "./adapters/chatgpt.js"

@@ -1,31 +1,11 @@
-﻿/**
- * Claude Code installer (shared CLI stage 9 uses this module).
- *
- * What it does (idempotent, clobber-free):
- *   1. Verifies Claude Code is installed (claude --version).
- *   2. Copies the bundled hook runner + MCP server into <project>/.opencomms/.
- *   3. Registers hooks + the OpenComms MCP server in project settings
- *      (.claude/settings.json) MERGING with existing config â€” never
- *      overwriting unrelated keys (Reviewer: "no unrelated-config clobbering").
- *   4. Registers the MCP server in .mcp.json (project scope) with a pinned
- *      member env placeholder.
- *   5. Reports capabilities honestly (hook-boundary delivery, no mid-turn push).
- */
+﻿/** Project hook/MCP installation merges owned entries and preserves unrelated configuration. */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { execFileSync } from "node:child_process"
 import { join, resolve, dirname } from "node:path"
-import { fileURLToPath } from "node:url"
 import { randomBytes } from "node:crypto"
 import { saveMemberPin, listMemberPins, isValidMemberId } from "../../mcp/identity.js"
-
-const __dirname2 = (() => {
-  try {
-    return dirname(fileURLToPath(import.meta.url))
-  } catch {
-    return process.cwd()
-  }
-})()
+import { readAdapterResource } from "../../cli/adapter-resources.js"
 
 export interface ClaudeCodeInstallReport {
   ok: boolean
@@ -53,11 +33,21 @@ function writeJsonStable(path: string, value: unknown): void {
 
 export function detectClaudeCode(): { detected: boolean; version: string | null } {
   try {
-    const out = execFileSync("claude", ["--version"], {
-      encoding: "utf8",
-      timeout: 15_000,
-      shell: process.platform === "win32",
-    })
+    // This detection-only command has no user input. Fixed cmd invocation
+    // supports npm launchers without shell:true concatenating an argv array.
+    const out =
+      process.platform === "win32"
+        ? execFileSync("cmd.exe", ["/d", "/s", "/c", "claude --version"], {
+            encoding: "utf8",
+            timeout: 15_000,
+            windowsHide: true,
+            stdio: ["ignore", "pipe", "pipe"],
+          })
+        : execFileSync("claude", ["--version"], {
+            encoding: "utf8",
+            timeout: 15_000,
+            stdio: ["ignore", "pipe", "pipe"],
+          })
     return { detected: true, version: out.trim() }
   } catch {
     return { detected: false, version: null }
@@ -111,37 +101,41 @@ export function installClaudeCode(projectDir: string, opts: { bundleDir?: string
   }
 
   const target = resolve(projectDir)
-  const opencommsDir = join(target, ".opencomms")
-  mkdirSync(opencommsDir, { recursive: true })
 
-  // 1. Bundle dir: resolve the package root by package.json (works from
-  //    src/, dist/, and dist-test/) and use its dist/; caller can override.
-  const bundleDir =
-    opts.bundleDir ??
-    (() => {
-      let dir = __dirname2
-      for (;;) {
-        if (existsSync(join(dir, "package.json"))) return join(dir, "dist")
-        const parent = dirname(dir)
-        if (parent === dir) return join(__dirname2, "..", "..", "..", "dist")
-        dir = parent
-      }
-    })()
-  const hookRunner = join(bundleDir, "adapters", "claude-code", "hook-cli.js")
-  const mcpServer = join(bundleDir, "mcp", "main.js")
-  if (!existsSync(hookRunner) || !existsSync(mcpServer)) {
+  // Parse-before-copy (atomicity): validate existing configs BEFORE any
+  // bundle copy or directory creation so a malformed settings/.mcp.json
+  // returns a structured failure with zero partial writes.
+  try {
+    readJson(join(target, ".claude", "settings.json"))
+    readJson(join(target, ".mcp.json"))
+  } catch (error) {
     report.ok = false
-    report.warnings.push(
-      "Built adapter files missing (dist/adapters/claude-code/hook-cli.js, dist/mcp/main.js). Run `npm run build` first.",
-    )
+    report.warnings.push(`Refusing to install with malformed config (nothing was written): ${(error as Error).message}`)
     return report
   }
 
-  copyFileSync(hookRunner, join(opencommsDir, "claude-code-hooks.mjs"))
-  copyFileSync(mcpServer, join(opencommsDir, "opencomms-mcp.mjs"))
+  let hookRunner: string
+  let mcpServer: string
+  try {
+    hookRunner = readAdapterResource(
+      "claude-hook",
+      opts.bundleDir ? join(opts.bundleDir, "adapters", "claude-code", "hook-cli.js") : undefined,
+    )
+    mcpServer = readAdapterResource(
+      "opencomms-mcp",
+      opts.bundleDir ? join(opts.bundleDir, "mcp", "main.js") : undefined,
+    )
+  } catch (error) {
+    report.ok = false
+    report.warnings.push((error as Error).message)
+    return report
+  }
+  const opencommsDir = join(target, ".opencomms")
+  mkdirSync(opencommsDir, { recursive: true })
+  writeFileSync(join(opencommsDir, "claude-code-hooks.mjs"), hookRunner, "utf8")
+  writeFileSync(join(opencommsDir, "opencomms-mcp.mjs"), mcpServer, "utf8")
   report.filesInstalled.push(".opencomms/claude-code-hooks.mjs", ".opencomms/opencomms-mcp.mjs")
 
-  // Hooks into project settings (.claude/settings.json), merged.
   // ${CLAUDE_PROJECT_DIR} is the documented placeholder Claude Code expands
   // inside hook command strings on ALL platforms (verified 2026-08-29;
   // PowerShell gets an automatic ${env:...} rewrite — %VAR% is NOT
@@ -163,12 +157,11 @@ export function installClaudeCode(projectDir: string, opts: { bundleDir?: string
     report.configPatches.push("hooks already registered (idempotent skip)")
   }
 
-  // 3. MCP server registration in project .mcp.json (project scope, committed).
   const mcpJsonPath = join(target, ".mcp.json")
   const mcpConfig = readJson(mcpJsonPath)
   const servers = isRecord(mcpConfig["mcpServers"]) ? (mcpConfig["mcpServers"] as Record<string, unknown>) : {}
   if (!servers["opencomms"]) {
-    // Absolute paths (Reviewer P3-3): a relative command path only works when
+    // Absolute paths: a relative command path only works when
     // Claude Code happens to cwd the MCP server at the project root; the
     // project dir is known at install time, so pin it.
     servers["opencomms"] = {
@@ -200,7 +193,7 @@ export function installClaudeCode(projectDir: string, opts: { bundleDir?: string
 /**
  * Register a member identity for this project: writes a PER-MEMBER pin file
  * (.opencomms/pins/<member_id>.json) that SessionStart binds against
- * (Reviewer P1-1 production wiring). The member id is minted here when not
+ *. The member id is minted here when not
  * supplied (opencomms-style id) and is validated against/created in state on
  * first join (bootstrap).
  *

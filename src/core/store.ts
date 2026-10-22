@@ -1,25 +1,12 @@
 ﻿/**
- * OpenComms â€” persistent state store.
- *
- * State is stored in `<project>/.opencomms/state.json`. Writes are
- * atomic: we serialize to a temp file in the same directory, flush it, then
- * rename over the target. On Windows, `rename` over an existing file is
- * supported by Node's fs.rename (it maps to MoveFileEx with REPLACE_EXISTING),
- * but we defensively retry once after a short delay because antivirus or
- * OneDrive can briefly hold a handle.
- *
- * Concurrency: multiple host sessions share one state.json. A bare
- * loadâ†’mutateâ†’save sequence can lose updates when interleaved across
- * processes. Every mutating read-modify-write therefore runs under an
- * exclusive-create lockfile (`.state.lock`) via `withLock`. The lock carries
- * PID + timestamp and is considered stale (breakable) after LOCK_STALE_MS so
- * a crashed process cannot wedge the channel forever.
+ * Project-local state uses atomic file replacement and bounded Windows retries.
+ * Mutating read-modify-write operations must use the exclusive cross-process
+ * lock to prevent lost updates; stale locks allow recovery after crashes.
  */
 
 import {
   mkdirSync,
   readFileSync,
-  renameSync,
   writeFileSync,
   existsSync,
   copyFileSync,
@@ -30,6 +17,7 @@ import {
   type PathOrFileDescriptor,
 } from "node:fs"
 import { dirname, join } from "node:path"
+import { replaceStateFile } from "./atomic-file.js"
 import { randomBytes } from "node:crypto"
 import {
   DEFAULT_MAX_MEMBERS,
@@ -41,8 +29,6 @@ import {
   STATE_DIR,
   STATE_FILE,
   type Channel,
-  type DeliveryMode,
-  type HostSurface,
   type State,
   type StalePolicy,
 } from "./types.js"
@@ -69,8 +55,6 @@ export function emptyState(): State {
     errors: [],
   }
 }
-
-// â”€â”€ Load-time validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const ROLE_PATTERN = /^[A-Za-z][A-Za-z0-9 _-]{0,31}$/
 
@@ -190,10 +174,7 @@ function isEmptyOperatorState(state: State): boolean {
 function backfillState(state: State): void {
   for (const channel of Object.values(state.channels)) {
     for (const member of channel.members) {
-      // Endpoint capabilities are DERIVED from delivery_mode when absent
-      // (additive evolution of spawn_push — see engine
-      // effectiveEndpointCapabilities). Never a schema bump: the field is
-      // optional and mode-derived defaults keep old rows correct.
+      // Missing endpoint capabilities retain delivery-mode defaults without a schema bump.
       if (!member.endpoint_capabilities) {
         member.endpoint_capabilities = effectiveEndpointCapabilities(member)
       }
@@ -211,7 +192,6 @@ function backfillState(state: State): void {
     if (!channel.cooldown_until) channel.cooldown_until = {}
     if (!channel.seen_content) channel.seen_content = {}
     if (!Array.isArray(channel.processed_correlations)) channel.processed_correlations = []
-    // Conversation budgets (additive; old channels default to unlimited).
     if (!channel.budgets || typeof channel.budgets !== "object") {
       channel.budgets = { max_runtime_ms: null, max_delivered_messages: null }
     } else {
@@ -220,8 +200,6 @@ function backfillState(state: State): void {
       if (!Number.isFinite(channel.budgets.max_runtime_ms)) channel.budgets.max_runtime_ms = null
       if (!Number.isFinite(channel.budgets.max_delivered_messages)) channel.budgets.max_delivered_messages = null
     }
-    // Session lifecycle + description + lineage (additive; old channels are
-    // and always were ACTIVE sessions with no description and no parent).
     if (channel.lifecycle !== "active" && channel.lifecycle !== "saved" && channel.lifecycle !== "deleted") {
       channel.lifecycle = "active"
     }
@@ -267,7 +245,6 @@ function backfillState(state: State): void {
         limit_member_id: byRole?.session_id ?? null,
       }
     } else {
-      // Ensure every field exists even on partially-written timers.
       channel.timer = {
         active_member_id: typeof legacyTimer.active_member_id === "string" ? legacyTimer.active_member_id : null,
         segment_started_at: typeof legacyTimer.segment_started_at === "number" ? legacyTimer.segment_started_at : null,
@@ -280,17 +257,12 @@ function backfillState(state: State): void {
       }
     }
   }
-  // Envelope debug fields (additive): old envelopes get explicit nulls so
-  // reads never see undefined; new envelopes carry root_message_id (lineage)
-  // and delivery_method (transport actually used).
   for (const msg of Object.values(state.messages)) {
     if (msg.root_message_id === undefined) msg.root_message_id = null
     if (msg.delivery_method === undefined) msg.delivery_method = null
   }
   if (!Array.isArray(state.errors)) state.errors = []
 }
-
-// â”€â”€ Store â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
  * Yield to the event loop instead of blocking it. Lock acquisition can wait
@@ -334,8 +306,9 @@ export class StateStore {
       try {
         fd = openSync(this.lockPath, "wx")
         break
-      } catch {
-        // Either EEXIST (someone else holds it) or a race lost. Inspect age.
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+        // Someone else holds it, or another creator won the race. Inspect age.
         try {
           const st = statSync(this.lockPath)
           if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
@@ -380,7 +353,7 @@ export class StateStore {
    *   legacy state dir / state.json (schema v1)
    *     -> <project>/.opencomms/state.json (schema v2)
    *
-   * Discipline (Reviewer Item 4): when the new dir is absent and a VALID v1
+   * Discipline: when the new dir is absent and a VALID v1
    * state exists, back it up, migrate it, and write MIGRATED_FROM_V1 so a
    * second load never re-migrates (no double-members, no duplication). An
    * existing v2 state is left alone except for the narrow upgrade case where
@@ -541,30 +514,7 @@ export class StateStore {
     mkdirSync(this.dir, { recursive: true })
     const tmp = join(this.dir, `.state.${process.pid}.${randomBytes(4).toString("hex")}.tmp`)
     const payload = JSON.stringify(state, null, 2)
-    writeFileSync(tmp, payload, "utf8")
-    try {
-      renameSync(tmp, this.file)
-    } catch (error) {
-      // Windows: retry once after a short yielding pause (AV/OneDrive races).
-      // A blocking 50ms stall is acceptable here: the write already happened,
-      // and this path is rare; the atomic-rename guarantee is what matters.
-      try {
-        // save() is intentionally synchronous (callers rely on durability
-        // when it returns), so this rare retry path uses a bounded 50ms
-        // blocking wait rather than async. LOCK acquisition â€” the path that
-        // can wait seconds â€” uses yielding sleepAsync instead.
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50)
-        renameSync(tmp, this.file)
-      } catch (second) {
-        try {
-          writeFileSync(this.file, payload, "utf8")
-        } catch {
-          throw new Error(
-            `OpenComms: failed to persist state (${(error as Error).message}; ${(second as Error).message})`,
-          )
-        }
-      }
-    }
+    replaceStateFile(this.file, tmp, payload)
   }
 
   /** Convenience: load, mutate, save â€” all under the cross-process lock. */

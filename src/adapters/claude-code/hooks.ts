@@ -1,24 +1,8 @@
 ﻿/**
- * Claude Code adapter — hook handlers.
- *
- * Claude Code hooks (verified 2026-08-29 against code.claude.com/docs/en/hooks)
- * fire at lifecycle boundaries and can inject context via stdout JSON
- * (hookSpecificOutput.additionalContext on SessionStart / UserPromptSubmit /
- * Stop). Hooks receive { session_id, cwd, hook_event_name, ... } on stdin.
- *
- * DELIVERY HONESTY: hook-boundary injection is NOT mid-turn push. Messages
- * arrive at the next hook boundary — documented as PARTIAL in
- * CAPABILITIES.md, never "push".
- *
- * IDENTITY NAMESPACE (Reviewer Issue 2): MCP-joined members are keyed by
- * their pinned OPENCOMMS_MEMBER_ID, while hooks observe CLAUDE CODE session
- * ids (a different namespace). The bridge is host_session_id: the
- * SessionStart hook records hostSessionId -> memberId binding; delivery
- * hooks resolve the incoming Claude session id through that index
- * (fail-closed on ambiguity). See core memberIndexByHostSession.
- *
- * All handlers are ASYNC end-to-end: Node keeps a CLI alive while promises
- * and timers are pending, so there is no blocking/spinning anywhere.
+ * Context arrives at hook boundaries, not mid-turn. Native host session ids
+ * differ from OpenComms member pins; host_session_id binds those namespaces.
+ * Resolve bindings fail-closed when ambiguous, and never block the host session
+ * because OpenComms delivery failed.
  */
 
 import { readFileSync } from "node:fs"
@@ -30,7 +14,6 @@ import {
   commitDelivery,
   drainForDelivery,
   formatDeliveryBatch,
-  isMember,
   markStale,
   resolveMemberByHostSession,
 } from "../../core/engine.js"
@@ -65,6 +48,28 @@ function readStdinJson(): ClaudeHookInput {
   }
 }
 
+/** Dispatch the host's documented event payload; unknown events do nothing. */
+export async function hookAutomatic(projectDir?: string): Promise<ClaudeHookOutput> {
+  const input = readStdinJson()
+  return hookFromInput(input, "claude-code", projectDir)
+}
+
+/** Shared hook transport for hosts with documented session/context payloads. */
+export async function hookFromInput(
+  input: ClaudeHookInput,
+  host: string,
+  projectDir?: string,
+): Promise<ClaudeHookOutput> {
+  if (!input.session_id) return {}
+  const dir = resolve(projectDir ?? input.cwd ?? process.cwd())
+  const event = input.hook_event_name
+  if (event === "SessionStart") return drainForHook(dir, input.session_id, event, { bindHostSession: true, host })
+  if (event === "UserPromptSubmit" || event === "Stop" || event === "BeforeAgent")
+    return drainForHook(dir, input.session_id, event, { host })
+  if (event === "SessionEnd") return endHookSession(dir, input.session_id, host)
+  return {}
+}
+
 /**
  * SessionStart hook: bind the host session id to the pinned member (if any),
  * clear staleness, deliver queued messages as additionalContext.
@@ -97,11 +102,15 @@ export async function hookStop(projectDir?: string): Promise<ClaudeHookOutput> {
 export async function hookSessionEnd(projectDir?: string): Promise<ClaudeHookOutput> {
   const input = readStdinJson()
   if (!input.session_id) return {}
+  return endHookSession(resolve(projectDir ?? input.cwd ?? process.cwd()), input.session_id)
+}
+
+async function endHookSession(dir: string, hostSessionId: string, host = "claude-code"): Promise<ClaudeHookOutput> {
   try {
-    const store = new StateStore(resolve(projectDir ?? input.cwd ?? process.cwd()))
+    const store = new StateStore(dir)
     await store.withLock(() => {
       const state = store.load()
-      const memberId = resolveOpenCommsMember(state, input.session_id!)
+      const memberId = resolveOpenCommsMember(state, hostSessionId, host)
       if (memberId) markStale(state, memberId)
       store.save(state)
     })
@@ -116,24 +125,15 @@ export async function hookSessionEnd(projectDir?: string): Promise<ClaudeHookOut
  * via the host_session_id index. Returns null when unknown — the caller
  * treats that as "not linked" (fail closed, no guessing).
  */
-function resolveOpenCommsMember(state: State, hostSessionId: string): string | null {
-  return resolveMemberByHostSession(state, "claude-code", hostSessionId)
+function resolveOpenCommsMember(state: State, hostSessionId: string, host = "claude-code"): string | null {
+  return resolveMemberByHostSession(state, host, hostSessionId)
 }
 
-/**
- * Core boundary logic shared by all delivery hooks.
- *
- * 1. Resolve the incoming Claude session_id -> OpenComms member (binding it
- *    first when asked — SessionStart records host_session_id for the pinned
- *    member whose binding is missing).
- * 2. Clear staleness (the session is demonstrably live).
- * 3. Drain that member's queue and frame every envelope as untrusted.
- */
 async function drainForHook(
   dir: string,
   hostSessionId: string,
   eventName: string,
-  opts: { bindHostSession?: boolean } = {},
+  opts: { bindHostSession?: boolean; host?: string } = {},
 ): Promise<ClaudeHookOutput> {
   try {
     const store = new StateStore(dir)
@@ -141,26 +141,21 @@ async function drainForHook(
     const linked = await store.withLock(() => {
       const state = store.load()
 
-      // 1. Bind host identity: SessionStart associates the live Claude
-      //    session with its OpenComms member (env pin, per-member pin files,
-      //    or the legacy single-member pin).
-      let memberId = resolveOpenCommsMember(state, hostSessionId)
+      const host = opts.host ?? "claude-code"
+      let memberId = resolveOpenCommsMember(state, hostSessionId, host)
       let guidance: string | undefined
       if (!memberId && opts.bindHostSession) {
-        const bound = bindPinnedMemberToHostSession(state, hostSessionId, dir)
+        const bound = bindPinnedMemberToHostSession(state, hostSessionId, dir, host)
         memberId = bound.memberId
         guidance = bound.guidance
         if (memberId) {
-          // Binding recorded — persist immediately.
           store.save(state)
         }
       }
       if (!memberId) return { pairs: [] as Array<{ id: string; channelName: string }>, guidance }
       boundMemberId = memberId
 
-      // 2. The session is live: clear staleness (mirrors OpenCode's
-      //    clearStale-on-idle; without this a member stays stale forever
-      //    after its first SessionEnd — Reviewer Issue 3).
+      // A live hook clears SessionEnd staleness so the member can receive mail again.
       clearStaleIfMember(state, memberId)
 
       // 3. Drain + frame, then persist the delivery marks (in_flight state,
@@ -217,7 +212,7 @@ async function drainForHook(
  *      multi-instance setups): binds (or REBINDS) exactly that member.
  *   2. Per-member pin files (.opencomms/pins/<member_id>.json, written by the
  *      installer): bind only when EXACTLY ONE claude-code member is both
- *      pinned and unbound (Reviewer P1-1: the old single pin file could bind
+ *      pinned and unbound (the old single pin file could bind
  *      the WRONG member or destroy another member's identity).
  *   3. Legacy member-pin.json (v2.0 single-member installs): same
  *      exactly-one-unbound rule, honored only when no per-member pins exist.
@@ -230,21 +225,21 @@ function bindPinnedMemberToHostSession(
   state: State,
   hostSessionId: string,
   projectDir: string,
+  host = "claude-code",
 ): { memberId: string | null; guidance?: string } {
   const envPin = process.env["OPENCOMMS_MEMBER_ID"]?.trim()
   if (envPin) {
     for (const channel of Object.values(state.channels)) {
       const member = channel.members.find((m) => m.session_id === envPin)
-      if (member && member.host === "claude-code") {
+      if (member && member.host === host) {
         member.host_session_id = hostSessionId
         return { memberId: member.session_id }
       }
     }
-    return { memberId: null, guidance: `OPENCOMMS_MEMBER_ID ${envPin} is not a claude-code member of any channel.` }
+    return { memberId: null, guidance: `OPENCOMMS_MEMBER_ID ${envPin} is not a ${host} member of any channel.` }
   }
 
-  // Pin-file path: candidates are pinned claude-code members with no binding.
-  const pins = listMemberPins(projectDir, "claude-code")
+  const pins = listMemberPins(projectDir, host)
   const legacyPin = pins.length === 0 ? loadProjectPin(projectDir) : null
   const pinnedIds = [...pins.map((p) => p.member_id), ...(legacyPin ? [legacyPin.member_id] : [])]
   if (pinnedIds.length === 0) return { memberId: null }
@@ -252,7 +247,7 @@ function bindPinnedMemberToHostSession(
   const unbound: Array<{ member: Member; pin: string }> = []
   for (const channel of Object.values(state.channels)) {
     for (const member of channel.members) {
-      if (member.host !== "claude-code") continue
+      if (member.host !== host) continue
       const pin = pinnedIds.find((id) => id === member.session_id)
       // Rebindable = never bound, OR bound to a session that ENDED
       // (SessionEnd marks stale). Without the stale case a Claude restart

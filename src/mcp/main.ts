@@ -1,15 +1,7 @@
-/**
- * OpenComms MCP stdio server entrypoint.
- *
- * One process serves ONE pinned channel member. The installer writes the pin:
- *   OPENCOMMS_MEMBER_ID=<member session id>   (required)
- *   OPENCOMMS_MEMBER_ROLE=<role label>        (informational)
- *   OPENCOMMS_CHANNEL=<channel>               (informational)
- *
- * JSON-RPC 2.0 over stdio only — no network listener, no LAN exposure.
- */
+/** Each stdio server serves one environment-pinned member; it opens no network listener. */
 
 import { resolve } from "node:path"
+import { pathToFileURL } from "node:url"
 import { McpStdioServer } from "./server.js"
 import { buildMcpToolDefs } from "./opencomms-tools.js"
 import { orchestratorTools } from "./orchestrator-tools.js"
@@ -18,7 +10,6 @@ import { StateStore } from "../core/store.js"
 import { ArchiveStore } from "../core/archive.js"
 import { createSpawnDeliveryHook } from "../hosts/spawn-delivery.js"
 import type { State, ToolResult } from "../core/types.js"
-import type { McpToolDef } from "./server.js"
 
 /** Programmatic entry (used by tests and host launchers). */
 export function serve(opts: { projectDir: string; host: string; admin: boolean }): void {
@@ -64,10 +55,15 @@ export function serve(opts: { projectDir: string; host: string; admin: boolean }
         readState: () => store.load(),
       },
     ),
-    // M4.6: the orchestrator tool surface (principal-classed, thin wrappers
-    // on OrchestratorApi). Operator tools register only for --admin
-    // instances; human-present tools always list (token-gated at call).
-    ...orchestratorTools(buildOrchestratorApi(resolve(opts.projectDir), store), opts.admin),
+    // Operator tools require --admin; human-present tools remain confirm-token gated.
+    ...orchestratorTools(buildOrchestratorApi(resolve(opts.projectDir), store), opts.admin, () => {
+      const pin = pinnedMember()
+      if (!pin) return null
+      const member = Object.values(store.load().channels)
+        .flatMap((c) => c.members)
+        .find((m) => m.session_id === pin.member_id && !m.stale)
+      return member ? { session_id: member.session_id, host_session_id: member.host_session_id ?? null } : null
+    }),
   ]
   const server = new McpStdioServer({ name: "opencomms", version: "2.0.0", tools })
   const pin = pinnedMember()
@@ -91,21 +87,14 @@ function cli(argv: string[]): void {
   serve({ projectDir: resolve(projectDir), host, admin })
 }
 
-// Run the CLI only when executed directly (not when imported by tests).
-// Matches every shipped filename: dist/mcp/main.js, installed
-// opencomms-mcp.mjs, .mcpb bundle server/main.mjs.
 const invoked = process.argv[1]?.replace(/\\/g, "/") ?? ""
 
-/**
- * M4.6: the OrchestratorApi for the MCP tool surface. Constructed with the
- * same project-local state the channel tools use (one core, both surfaces).
- */
+/** Construct the orchestrator API over the same project state as channel tools. */
 import { OrchestratorApi } from "../orchestrator/api.js"
 import { OrchestratorStore } from "../orchestrator/state.js"
 import { createOrchestratorFeed } from "../orchestrator/events.js"
-import { startGuiServer } from "../gui/server.js"
 
-function buildOrchestratorApi(projectDir: string, store: StateStore): OrchestratorApi {
+export function buildOrchestratorApi(projectDir: string, store: StateStore): OrchestratorApi {
   const orchStore = new OrchestratorStore(resolve(projectDir), store)
   const feed = createOrchestratorFeed((fn) =>
     orchStore.withLock(() => {
@@ -125,29 +114,29 @@ function buildOrchestratorApi(projectDir: string, store: StateStore): Orchestrat
     saveOrchestrator: (s) => orchStore.save(s),
     loadChannelEngineState: () => store.load(),
     engineSend: (state, input, senderSessionId) => channelSend(state, input, senderSessionId),
-    saveChannelEngineState: (state) => {
-      void state
-      /* channel-state saves flow through the mutate() path above */
-    },
+    saveChannelEngineState: (state) => store.save(state as State),
     feed,
     projectId: () => process.env["OPENCOMMS_PROJECT_ID"] ?? null,
   })
 }
 
-import { sendMessage as engineSendMessage } from "../core/engine.js"
+import { sendMessageAsOperator } from "../core/engine.js"
 function channelSend(
   state: unknown,
-  input: { channel: string; content: string; message_type: "review_request" },
+  input: { channel: string; content: string; message_type: "review_request"; to?: string },
   senderSessionId: string,
 ): { ok: boolean; message: string } {
-  const result = engineSendMessage(
-    state as State,
-    { channel: input.channel, content: input.content, type: input.message_type },
-    senderSessionId,
-  )
+  void senderSessionId
+  const result = sendMessageAsOperator(state as State, {
+    channel: input.channel,
+    content: input.content,
+    type: input.message_type,
+    to: input.to,
+  })
   return { ok: result.ok, message: result.message }
 }
 if (
+  (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) ||
   /mcp[\\/]main\.(js|mjs|ts)$/.test(invoked) ||
   /opencomms-mcp\.mjs$/.test(invoked) ||
   /[\\/]server[\\/]main\.(mjs|js)$/.test(invoked)

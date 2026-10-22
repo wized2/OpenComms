@@ -1,62 +1,31 @@
 /**
- * OpenCode AgentRuntime (M1; promoted from the M0 spike,
- * docs/spike-spawn-opencode.md — spike scripts are disposable; this file is
- * the hardened, integrated version).
- *
- * Topology (Lead decisions 2026-09-11 + spike ground truth):
- *  - ONE shared `opencode serve` per project (never per agent): argv-only
- *    launch, `--hostname 127.0.0.1`, loopback bind, env-only auth handoff
- *    (OPENCODE_SERVER_PASSWORD is generated here, never on the command line,
- *    never logged, never returned).
- *  - Agents are sessions created over the SDK: `session.create` →
- *    `prompt`/`promptAsync` → `abort`; status is SSE-driven (the spike proved
- *    GET /session/status unreliable mid-turn).
- *  - The model is ALWAYS pinned and pre-verified (detect() caches the
- *    provider/model catalog); server defaults failed or hung in the spike.
- *  - Native-exe resolution: Windows npm shims (.ps1/.cmd) cannot be
- *    execFile-spawned; the native binary path is resolved (or taken from the
- *    OPENCOMMS_OPENCODE_BIN override — same pattern as CLAUDE_BIN/CODEX_BIN).
- *  - Kill semantics (recorded): SIGTERM on the serve kills ALL sessions on
- *    the instance (accepted shared-instance tradeoff; single trust tier).
+ * One shared loopback serve per project, launched with argv and env-only credentials.
+ * Managed sessions require a verified model pin and exact identity before delivery.
+ * Session abort stops one agent; killing the shared serve stops every session.
  */
 
 import { spawn as nodeSpawn, execFileSync, type ChildProcess } from "node:child_process"
 import { existsSync } from "node:fs"
 import { join } from "node:path"
 import { randomBytes } from "node:crypto"
-import type { AgentHandle, AgentRuntime, RuntimeDetectResult, SpawnRequest, SpawnResult } from "../runtime.js"
-import type { AgentRecord, AgentRuntimeStatus } from "../state.js"
+import type { AgentHandle, AgentRuntime, RuntimeDetectResult, SpawnRequest } from "../runtime.js"
+import type { AgentRecord } from "../state.js"
 
-/** Env override for the native opencode binary (generalized M1 decision). */
 export const OPENCODE_NATIVE_BIN_ENV = "OPENCOMMS_OPENCODE_BIN"
 
-/**
- * Serve-ready timeout (Lead requirement 2): the stdout "listening" poll is
- * TIMEOUT-BOUNDED, never open-ended (same rule as turn waits).
- */
 export const SERVE_READY_TIMEOUT_MS = 30_000
-const SERVE_POLL_MS = 200
 
-/** Resolve the spawnable native executable (npm shims cannot be execFile'd).
- *  Windows: APPDATA npm layout scan. Linux: bare PATH lookup — see Platform's
- *  doctor G5 note for daemon/systemd contexts (nvm shims are NOT on a systemd
- *  service PATH; configure OPENCOMMS_OPENCODE_BIN there). */
+/** Resolve a native executable: Windows npm shims cannot be spawned directly. */
 export function resolveOpencodeBinary(env: NodeJS.ProcessEnv = process.env): string {
   const override = env[OPENCODE_NATIVE_BIN_ENV]?.trim()
   if (override) return override
   const direct = join("node_modules", "opencode-ai", "bin", "opencode.exe")
   for (const base of [process.env.APPDATA ? join(process.env.APPDATA, "npm") : null].filter(Boolean) as string[]) {
-    // Regression invariant (Frontend-found bug): the RETURNED path must be
-    // the SAME path that existsSync checked — never a re-joined variant.
+    // Return exactly the path checked for existence.
     const candidate = join(base, direct)
     if (existsSync(candidate)) return candidate
   }
-  // Fall back to the bare name (POSIX, or a caller-managed PATH resolution).
-  // v22 guard (Lead's fix order item 2): a bare name on a runner WITHOUT the
-  // binary spawns ENOENT — but that rejection MUST NOT escape ensureServe's
-  // catch as an unhandled rejection under v22's scheduling. ensureServe
-  // wraps the spawn in try/catch, so the bare name stays; the guard is that
-  // the spawn path settles the poll even on throw (see ensureServe).
+  // Fall back to PATH; ensureServe handles missing executables without unhandled errors.
   return "opencode"
 }
 
@@ -67,21 +36,21 @@ export interface OpencodeRuntimeOptions {
   port: number
   /** Injected env (tests); defaults to process.env. */
   env?: NodeJS.ProcessEnv
-  /** Injected spawner (tests pass a fake; production uses node:child_process). */
+  /** Compatibility option; shared serve spawning is configured through ensureServe. */
   spawnFn?: (cmd: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv }) => ChildProcess
-  /** Turn-wait timeout ms (spike rule: never open-ended). */
+  /** Compatibility option; delivery no longer waits for assistant completion. */
   turnTimeoutMs?: number
-  /** Poll interval for turn completion. */
+
   pollMs?: number
   /** Injected transport for SDK calls (tests); production builds fetch-based. */
   transport?: OpencodeTransport
 }
 
-/**
- * Minimal HTTP transport the runtime needs (implemented with fetch against
- * the serve's HTTP API — the SDK's createOpencodeClient surface, narrowed).
- */
+/** Narrow host transport used by the managed runtime. */
 export interface OpencodeTransport {
+  /** Verify the persisted identity against this server, without creating it. */
+  getSession?(sessionId: string): Promise<{ id: string }>
+  sessionStatus?(sessionId: string): Promise<{ type: string; detail?: string } | null>
   createSession(title: string): Promise<{ id: string }>
   prompt(sessionId: string, text: string, model?: { providerID: string; modelID: string }): Promise<void>
   abort(sessionId: string): Promise<void>
@@ -96,9 +65,8 @@ export interface OpencodeTransport {
     }>
   >
   /**
-   * M2 §9b-4: host permission surface (GET list + POST response), backed by
-   * the serve's /session/:id/permissions routes. Returns null for "list
-   * unsupported" on older serves.
+   * The host's global permission list is filtered to this exact session.
+   * Returns null only for an unsupported list route on older serves.
    */
   permissionsList(sessionId: string): Promise<Array<{ permission_id: string; request?: unknown }> | null>
   permissionsRespond(sessionId: string, permissionId: string, response: "allow" | "deny"): Promise<void>
@@ -109,7 +77,7 @@ export function basicAuthHeader(username: string, password: string): string {
   return `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`
 }
 
-/** Extract the LAST assistant text from a session.messages payload (spike shape). */
+/** Return the last assistant text with its host completion and error fields. */
 export function lastAssistantText(
   rows: Array<{
     info: {
@@ -134,25 +102,42 @@ export function lastAssistantText(
   }
 }
 
-/**
- * Production transport over the shared serve (fetch; basic auth from env the
- * caller holds in memory only). Kept minimal: exactly the spike-proven calls.
- */
-export function createHttpTransport(baseUrl: string, password: string, username = "orchestrator"): OpencodeTransport {
+/** Loopback transport with in-memory credentials and an explicit runtime directory. */
+export function createHttpTransport(
+  baseUrl: string,
+  password: string,
+  username = "orchestrator",
+  directory?: string,
+): OpencodeTransport {
   const headers: Record<string, string> = {
     Authorization: basicAuthHeader(username, password),
     "Content-Type": "application/json",
   }
   const call = async (path: string, init?: RequestInit): Promise<unknown> => {
-    const res = await fetch(`${baseUrl}${path}`, { headers, ...init })
+    const endpoint = new URL(path, baseUrl)
+    if (directory) endpoint.searchParams.set("directory", directory)
+    const res = await fetch(endpoint, { headers, signal: AbortSignal.timeout(30_000), ...init })
     if (!res.ok) {
-      const body = await res.text().catch(() => "")
-      throw new Error(`opencode ${path} failed (${res.status}): ${body.slice(0, 200)}`)
+      // Host bodies may contain credentials, prompt contents or tool output.
+      throw new Error(`opencode ${path} failed (${res.status})`)
     }
     const text = await res.text()
     return text ? JSON.parse(text) : {}
   }
   return {
+    async getSession(sessionId) {
+      const payload = (await call(`/session/${encodeURIComponent(sessionId)}`)) as { id?: string }
+      if (payload.id !== sessionId) throw new Error("opencode returned a different session identity")
+      return { id: payload.id }
+    },
+    async sessionStatus(sessionId) {
+      // Idle rows are removed from SessionStatus.list by the host. Confirm
+      // the identity first so absence cannot turn a deleted session into idle.
+      const session = (await call(`/session/${encodeURIComponent(sessionId)}`)) as { id?: string }
+      if (session.id !== sessionId) throw new Error("opencode session identity is unavailable")
+      const payload = (await call("/session/status")) as Record<string, { type: string }>
+      return payload[sessionId] ?? { type: "idle" }
+    },
     async createSession(title) {
       const created = (await call("/session", { method: "POST", body: JSON.stringify({ title }) })) as {
         id?: string
@@ -165,99 +150,64 @@ export function createHttpTransport(baseUrl: string, password: string, username 
     async prompt(sessionId, text, model) {
       const body: Record<string, unknown> = { parts: [{ type: "text", text }] }
       if (model) body.model = model
-      await call(`/session/${sessionId}/message`, { method: "POST", body: JSON.stringify(body) })
+      // 204 confirms host acceptance. Completion belongs to execution state,
+      // so delivery never waits for an assistant response or retries its work.
+      await call(`/session/${encodeURIComponent(sessionId)}/prompt_async`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      })
     },
     async abort(sessionId) {
-      await call(`/session/${sessionId}/abort`, { method: "POST", body: "{}" })
+      await call(`/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST", body: "{}" })
     },
     async messages(sessionId) {
-      const payload = (await call(`/session/${sessionId}/message`)) as
+      const payload = (await call(`/session/${encodeURIComponent(sessionId)}/message`)) as
         | Array<{ info: { role: string }; parts: Array<{ type: string; text?: string }> }>
         | { data?: Array<{ info: { role: string }; parts: Array<{ type: string; text?: string }> }> }
       return Array.isArray(payload) ? payload : (payload.data ?? [])
     },
     async permissionsList(sessionId) {
-      // GET /session/:id/permissions — 404 on older serves = unsupported.
+      // Official SDK permission.list: GET /permission. Its list spans all
+      // sessions, so never expose another agent's approval requests.
       try {
-        const payload = (await call(`/session/${sessionId}/permissions`)) as
-          | Array<{ id?: string; permission_id?: string; request?: unknown }>
-          | { data?: Array<{ id?: string; permission_id?: string; request?: unknown }> }
-        const rows = Array.isArray(payload) ? payload : (payload.data ?? [])
-        return rows.map((r) => ({ permission_id: r.permission_id ?? r.id ?? "", request: (r.request ?? r) as unknown }))
+        const payload = await call("/permission")
+        if (!Array.isArray(payload)) throw new Error("opencode permission list returned an invalid response")
+        return payload
+          .filter((row: unknown): row is { id: string; sessionID: string } => {
+            if (typeof row !== "object" || row === null) return false
+            const value = row as Record<string, unknown>
+            return value.sessionID === sessionId && typeof value.id === "string" && value.id.length > 0
+          })
+          .map((row) => ({ permission_id: row.id, request: row }))
       } catch (error) {
         if (/\(404\)/.test(String(error))) return null
         throw error
       }
     },
     async permissionsRespond(sessionId, permissionId, response) {
-      await call(`/session/${sessionId}/permissions/${permissionId}`, {
+      const pending = await this.permissionsList(sessionId)
+      if (pending === null) throw new Error("opencode permission API is unsupported by this server")
+      if (!pending.some((row) => row.permission_id === permissionId))
+        throw new Error("permission request is not pending for this agent")
+      await call(`/permission/${encodeURIComponent(permissionId)}/reply`, {
         method: "POST",
-        body: JSON.stringify({ response, remember: false }),
+        body: JSON.stringify({ reply: response === "allow" ? "once" : "reject" }),
       })
     },
   }
 }
 
-const DEFAULT_TURN_TIMEOUT_MS = 180_000
-const DEFAULT_POLL_MS = 1_500
-
-/** Poll messages until the turn completes, errors, or the timeout hits. */
-async function waitTurn(
-  transport: OpencodeTransport,
-  sessionId: string,
-  turnTimeoutMs: number,
-  pollMs: number,
-): Promise<{ text: string; error: string | null }> {
-  const start = Date.now()
-  for (;;) {
-    await new Promise((r) => setTimeout(r, pollMs))
-    const rows = await transport.messages(sessionId)
-    const last = rows.filter((r) => r.info?.role === "assistant").at(-1)
-    if (last?.info?.error) {
-      return { text: "", error: last.info.error?.data?.message ?? "opencode turn error" }
-    }
-    if (last?.info?.time?.completed) {
-      return {
-        text: (last.parts ?? [])
-          .filter((p) => p.type === "text")
-          .map((p) => p.text ?? "")
-          .join(" | "),
-        error: null,
-      }
-    }
-    if (Date.now() - start > turnTimeoutMs) {
-      return { text: "", error: `opencode turn wait timed out after ${turnTimeoutMs}ms` }
-    }
-  }
-}
-
-/**
- * Result of ensureServe (M1's last code item; Lead-approved spec):
- * the shared serve is ONE managed child per project, argv-only launch,
- * env-only password (NEVER logged, NEVER persisted — memory + child env).
- */
+/** Shared serve child; credentials stay in memory and child env only. */
 export interface ServeLaunchResult {
   ok: boolean
   port: number
   detail: string
   child: ChildProcess | null
-  /**
-   * The generated basic-auth header value for the serve (memory-only). The
-   * GUI's ensureServeRunning() keeps this in process memory and passes it to
-   * the runtime env — it is NEVER logged, persisted, or returned by any API.
-   * Exposed here (not a raw password) so callers hold exactly the credential
-   * they need and nothing more.
-   */
+  /** Memory-only serve auth header; never persist, log or return it through an API. */
   authHeader: string | null
 }
 
-/**
- * Ensure exactly one `opencode serve` is running for the project.
- * Idempotent: a second call while the first child is alive returns the
- * existing port. Readiness = the stdout "listening" line, timeout-bounded.
- * On spawn failure (ENOENT / binary missing) the caller fails the create
- * cleanly — the orchestrator never leaves an orphan.
- */
+/** Reuse the project serve or launch one with bounded readiness and failure cleanup. */
 export async function ensureServe(opts: {
   projectDir: string
   preferredPort: number
@@ -301,18 +251,9 @@ export async function ensureServe(opts: {
       authHeader: null,
     }
   }
-  child.on?.("error", () => {
-    /* surfaced via the ready-poll timeout/close; the result below reports */
-  })
-  // v22 node:test hardening (Lead's fix order item 1): the 'error' listener
-  // on the CHILD is a listener, but a spawned child that errors (e.g. ENOENT
-  // surfacing post-spawn) must still settle the poll — the 'exit' handler
-  // covers the normal case; this 'error' path now also settles so the
-  // awaiting test can never hang on an error-only child.
-  child.once?.("error", () => {
-    /* pollServeReady's timeout settles the promise; this listener prevents
-       an unhandled 'error' event from escaping as an unhandled rejection. */
-  })
+  // Prevent unhandled child errors; readiness fails on exit or timeout.
+  child.on?.("error", () => {})
+
   const ready = await pollServeReady(child, opts.readyTimeoutMs ?? SERVE_READY_TIMEOUT_MS)
   if (!ready.ok) {
     try {
@@ -335,17 +276,7 @@ function defaultServeSpawn(cmd: string, args: string[], spOpts: { cwd: string; e
   return nodeSpawn(cmd, args, { ...spOpts, stdio: ["ignore", "pipe", "pipe"], shell: false, windowsHide: true })
 }
 
-/**
- * Poll the child's stdout for the readiness line (timeout-bounded).
- *
- * v22 node:test hardening (Lead's fix order 2026-09-13): the promise RESOLVES
- * on every path — timer, "listening" line, child 'exit', and a guard for
- * children whose stdout/stderr are ABSENT (some fakes and edge hosts) so the
- * timer is the sole fallback and nothing can leave the awaiting test
- * un-resolved. The `child.on("error")` sibling is wired in ensureServe
- * (listener, not promise-critical); the spawn-throw path is handled in
- * ensureServe's catch BEFORE the poll starts.
- */
+/** Readiness resolves on a listening line, child exit or timeout. */
 async function pollServeReady(
   child: ChildProcess,
   timeoutMs: number,
@@ -365,12 +296,7 @@ async function pollServeReady(
         detail: `serve did not report listening within ${timeoutMs}ms${output ? ` (output: ${output.slice(0, 200)})` : ""}`,
       })
     }, timeoutMs)
-    // NOTE: intentionally NOT unref'd — this timer is promise-critical: under
-    // node:test on Node v22 (CI's pinned buildNode) an unref'd timeout with no
-    // other pending work lets the loop drain before it fires, so the awaited
-    // promise never resolves and the whole test run cancels. Orphan-safety is
-    // guaranteed by the explicit child.kill("SIGTERM") on the timeout path
-    // below, not by unref. (Platform CI diagnosis 2026-09-12.)
+    // Keep the timeout referenced: unref could leave the awaited promise unresolved.
     const onLine = (chunk: Buffer | string): void => {
       output += chunk.toString()
       if (output.includes("listening")) {
@@ -400,72 +326,62 @@ export function createOpencodeRuntime(opts: OpencodeRuntimeOptions): AgentRuntim
   const exe = resolveOpencodeBinary(env)
   const port = opts.port
   const baseUrl = `http://127.0.0.1:${port}`
-  const turnTimeoutMs = opts.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS
-  const pollMs = opts.pollMs ?? DEFAULT_POLL_MS
-  const spawnFn =
-    opts.spawnFn ??
-    ((cmd: string, args: string[], spOpts: { cwd: string; env: NodeJS.ProcessEnv }) =>
-      nodeSpawn(cmd, args, { ...spOpts, stdio: ["ignore", "pipe", "pipe"], shell: false, windowsHide: true }))
-  let transport = opts.transport ?? null
+  const transports = new Map<string, OpencodeTransport>()
   const detected: RuntimeDetectResult = { available: false }
 
-  const ensureTransport = (): OpencodeTransport => {
-    // Reviewer P4: an empty password would surface as an opaque 401 from the
-    // serve; fail early with the actionable cause instead.
+  const ensureTransport = (directory = opts.projectDir): OpencodeTransport => {
     if (!env["OPENCOMMS_ORCH_SERVE_PASSWORD"]?.trim()) {
       throw new Error("serve password not configured (OPENCOMMS_ORCH_SERVE_PASSWORD is empty)")
     }
-    if (!transport) transport = createHttpTransport(baseUrl, env["OPENCOMMS_ORCH_SERVE_PASSWORD"] ?? "")
+    if (opts.transport) return opts.transport
+    let transport = transports.get(directory)
+    if (!transport) {
+      transport = createHttpTransport(baseUrl, env["OPENCOMMS_ORCH_SERVE_PASSWORD"] ?? "", "orchestrator", directory)
+      transports.set(directory, transport)
+    }
     return transport
   }
 
-  const makeHandle = (sessionId: string): AgentHandle => ({
+  const makeHandle = (sessionId: string, directory: string): AgentHandle => ({
     async deliver(framed) {
       try {
-        const t = ensureTransport()
+        const t = ensureTransport(directory)
         const model = parseModel(env["OPENCOMMS_ORCH_SERVE_MODEL"])
         await t.prompt(sessionId, framed, model)
-        const turn = await waitTurn(t, sessionId, turnTimeoutMs, pollMs)
-        if (turn.error) return "failed"
         return "delivered"
-      } catch {
-        return "failed"
+      } catch (error) {
+        // A failed transport after submitting can leave accepted work. Never
+        // label that safe to retry; the coordinator retains the delivery id.
+        return /failed \((400|401|403|404|409|422)\)/.test(String(error)) ? "failed" : "uncertain"
       }
     },
     async abort() {
-      try {
-        await ensureTransport().abort(sessionId)
-      } catch {
-        /* abort is best-effort; the serve may already have ended the turn */
-      }
+      await ensureTransport(directory).abort(sessionId)
     },
     async status() {
-      // Honest snapshot only: without the SSE tap connected, "running" is the
-      // neutral managed-state; the feed (SSE) remains the authority.
-      return { status: "running" as AgentRuntimeStatus }
+      try {
+        const t = ensureTransport(directory)
+        if (!t.sessionStatus) return { status: "stale", detail: "runtime status is unavailable" }
+        const observed = await t.sessionStatus(sessionId)
+        if (observed?.type === "idle") return { status: "idle" }
+        if (observed?.type === "busy" || observed?.type === "retry") return { status: "running", detail: observed.type }
+        return { status: "stale", detail: "host did not report this session's activity" }
+      } catch (error) {
+        return { status: "stale", detail: (error as Error).message }
+      }
     },
     async stop() {
-      // Per-agent stop on a SHARED serve is a session abort, not a process
-      // kill (killing the serve would stop ALL agents — the accepted M1
-      // tradeoff). Full teardown is shutdownNode().
-      try {
-        await ensureTransport().abort(sessionId)
-      } catch {
-        /* already stopped */
-      }
+      // Abort this session; process shutdown would stop every shared-serve agent.
+      await ensureTransport(directory).abort(sessionId)
     },
     async permissionsDrain() {
-      try {
-        const rows = await ensureTransport().permissionsList(sessionId)
-        if (rows === null) return null
-        return rows.map((r) => ({ permission_id: r.permission_id, request: r.request as unknown }))
-      } catch {
-        return null
-      }
+      const rows = await ensureTransport(directory).permissionsList(sessionId)
+      if (rows === null) return null
+      return rows.map((r) => ({ permission_id: r.permission_id, request: r.request as unknown }))
     },
     async permissionsRespond(permissionId, response) {
       try {
-        await ensureTransport().permissionsRespond(sessionId, permissionId, response)
+        await ensureTransport(directory).permissionsRespond(sessionId, permissionId, response)
         return { ok: true, message: `permission ${permissionId} ${response}ed` }
       } catch (error) {
         return { ok: false, message: (error as Error).message }
@@ -477,12 +393,15 @@ export function createOpencodeRuntime(opts: OpencodeRuntimeOptions): AgentRuntim
     runtime: "opencode",
     host: "opencode",
     async detect() {
-      // Cached: detect() may be called per request; refresh only on demand.
       if (detected.available) return detected
       try {
         const binary = resolveOpencodeBinary(env)
-        detected.available = true
         detected.version = runVersion(binary)
+        detected.available = Boolean(detected.version)
+        if (!detected.available) {
+          detected.detail = "OpenCode executable did not answer --version; configure OPENCOMMS_OPENCODE_BIN"
+          return detected
+        }
         detected.providers = listModelsCatalog(binary, opts.projectDir)
       } catch (error) {
         detected.available = false
@@ -492,19 +411,16 @@ export function createOpencodeRuntime(opts: OpencodeRuntimeOptions): AgentRuntim
     },
     async create(req: SpawnRequest) {
       try {
-        const t = ensureTransport()
+        const t = ensureTransport(req.worktree)
         const created = await t.createSession(req.name)
-        // Compose the role prompt + first prompt: persistent role injection
-        // for opencode runs via the system-prompt transform when the plugin
-        // is present; the first prompt ALWAYS carries the role text inline
-        // (spike-proven inline path) so headless runs are never unguided.
+        // Inline the role prompt so headless sessions receive it without plugin injection.
         const first = `You are ${req.role} on OpenComms channel work. ${req.role_prompt}`.trim()
         const model = parseModel(env["OPENCOMMS_ORCH_SERVE_MODEL"])
         await t.prompt(created.id, first, model)
         return {
           ok: true,
           result: { host_session_id: created.id, spawn_cmd_redacted: redact(exe, port) },
-          handle: makeHandle(created.id),
+          handle: makeHandle(created.id, req.worktree),
         }
       } catch (error) {
         return { ok: false, message: (error as Error).message }
@@ -512,15 +428,23 @@ export function createOpencodeRuntime(opts: OpencodeRuntimeOptions): AgentRuntim
     },
     async resume(rec: AgentRecord) {
       if (!rec.host_session_id) return { ok: false, message: "agent record has no host_session_id to resume" }
-      return { ok: true, handle: makeHandle(rec.host_session_id) }
+      try {
+        const directory = rec.worktree || opts.projectDir
+        const t = ensureTransport(directory)
+        if (t.getSession) await t.getSession(rec.host_session_id)
+        else await t.messages(rec.host_session_id)
+        return { ok: true, handle: makeHandle(rec.host_session_id, directory) }
+      } catch (error) {
+        return { ok: false, message: `Cannot resume the recorded session: ${(error as Error).message}` }
+      }
     },
     async shutdownNode() {
-      transport = null
+      transports.clear()
     },
   }
 }
 
-/** Parse "provider/model" (spike rule: always pinned). null = not pinned. */
+/** Parse an explicit provider/model pin; missing pins remain undefined. */
 export function parseModel(value: string | undefined): { providerID: string; modelID: string } | undefined {
   const raw = value?.trim()
   if (!raw) return undefined
@@ -539,21 +463,10 @@ function runVersion(binary: string): string | undefined {
   }
 }
 
-/**
- * Provider/model catalog cache (M1 requirement: powers the create-agent
- * dialog's model picker). Runs `opencode models` ONCE per runtime instance
- * and parses `provider/model` lines; the API layer serves it via
- * GET /nodes/{id}/runtimes. No credentials pass through; output is the
- * CLI's public list.
- */
+/** Cache the public provider/model catalogue for managed-agent selection. */
 const MODELS_TIMEOUT_MS = 30_000
 
-/**
- * Pure line parser for the `opencode models` output — exported so tests can
- * drive it DIRECTLY (no exec, no exec-bit: the CI root cause was the exec
- * fixture failing on noexec mounts, Platform/Lead diagnosis 2026-09-13).
- * Production never parses anything else; this is the same code path.
- */
+/** Parse public opencode models output without invoking a process. */
 export function parseModelsOutput(out: string): Array<{ provider: string; models: string[] }> {
   const byProvider = new Map<string, Set<string>>()
   for (const rawLine of out.split(/\r?\n/)) {

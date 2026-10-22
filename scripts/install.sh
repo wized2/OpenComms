@@ -1,32 +1,8 @@
 #!/bin/sh
-# OpenComms Linux installer v2 (Workstream L, Platform).
-#
-# One-command install (curl-pipe-bash safe, also runnable from a checkout):
-#   curl -fsSL https://raw.githubusercontent.com/CL-BAF/OpenComms/main/scripts/install.sh | bash
-#
-# What it does, strictly in order, fail-closed at every step:
-#   1. Platform guard (Linux x86_64 only; unsupported arch fails with a clear message)
-#   2. Resolve latest release version from GitHub Releases (api.github.com)
-#   3. Download tarball + SHA256SUMS (single trusted source, HTTPS, same-origin)
-#   4. VERIFY checksums BEFORE extract (sha256sum -c semantics)
-#   5. Extract into a private staging dir and EXECUTE-BEFORE-INSTALL
-#      (`version` + `doctor` must exit 0 before any system change)
-#   6. Atomic replace into the bin dir with rollback-on-failure
-#   7. Post-install validation (`opencomms version`, downgrade guard)
-#   8. Idempotent PATH handling (no duplicate appends; writes ~/.profile only)
-#   9. Summary + update hint
-#
-# Optional --service: ALSO install the systemd USER unit (previous approved
-# behaviour; orthogonal). curl|bash defaults to binary-only; run install.sh
-# from a checkout or a downloaded tarball for --service.
-#
-# Privilege policy: NEVER runs privileged commands (no sudo) and NEVER
-# enables or starts the service; systemctl/linger actions are PRINTED. The
-# only systemctl action executed anywhere remains the unprivileged
-# `systemctl --user daemon-reload` when REPLACING an existing unit.
-# Running as root is allowed but loud: the target bin dir resolves to the
-# INVOKING user's home (or --bin-dir), never silently to /root/.local/bin.
-# Secrets are never written. Project .opencomms state is never touched.
+# Linux x86_64 installer: verify and validate before atomic replacement.
+# Preserve project state and roll back failed updates.
+# Installation is per-user; service enable/start and linger actions are printed only.
+# Replacing an existing unit may run unprivileged systemctl --user daemon-reload.
 set -eu
 
 REPO="CL-BAF/OpenComms"
@@ -92,7 +68,7 @@ fetch() {
     case "$FETCH" in
       curl)
         # -f: HTTP errors fail (never parse an HTML error page as an artifact).
-        # --max-filesize: hostile-origin disk-fill defense (Reviewer P4).
+        # --max-filesize: hostile-origin disk-fill defense.
         if curl -fsSL --connect-timeout 15 --retry 0 --max-filesize 209715200 -o "$out" "$url"; then return 0; fi
         ;;
       wget)
@@ -117,7 +93,6 @@ api_get() {
   fetch "https://api.github.com${1}" "$2"
 }
 
-# ---------- argument parsing ----------
 version_arg=""
 bin_dir_override=""
 exe_override=""
@@ -152,7 +127,7 @@ case "$(uname -m)" in
   *) fail "unsupported architecture '$(uname -m)' (v1 ships x86_64 only; arm64 is planned once proven clean)" ;;
 esac
 
-# Invoking-user home resolution (Reviewer-safe root handling): as root,
+# Invoking-user home resolution: as root,
 # resolve the REAL invoking user's home when available so we never silently
 # install into /root/.local/bin while claiming to install "for the user".
 resolve_home() {
@@ -172,15 +147,18 @@ if [ "$do_uninstall" -eq 1 ]; then
   bin_dir=${bin_dir_override:-${OPENCOMMS_INSTALL_DIR:-"$real_home/.local/bin"}}
   target="$bin_dir/opencomms"
   unit_file="${XDG_CONFIG_HOME:-"$real_home/.config"}/systemd/user/opencomms.service"
+  node_unit_file="${XDG_CONFIG_HOME:-"$real_home/.config"}/systemd/user/opencomms-node.service"
   removed=""
   if [ -f "$target" ]; then rm -f "$target" && removed="$target"; fi
   if [ -f "$unit_file" ]; then rm -f "$unit_file" && removed="$removed $unit_file"; fi
+  if [ -f "$node_unit_file" ]; then rm -f "$node_unit_file" && removed="$removed $node_unit_file"; fi
   if [ -n "$removed" ]; then
     info "Removed:$removed"
   else
-    info "Nothing installed at $target or $unit_file."
+    info "Nothing installed at $target, $unit_file, or $node_unit_file."
   fi
   printf 'If the service was enabled, run: systemctl --user daemon-reload && systemctl --user disable --now opencomms\n'
+  printf 'If the node daemon was enabled, run: systemctl --user daemon-reload && systemctl --user disable --now opencomms-node\n'
   printf 'Optionally (only if no other user services need it): loginctl disable-linger %s\n' "${SUDO_USER:-$(id -un)}"
   printf 'Project .opencomms state and archives were NOT touched.\n'
   exit 0
@@ -188,12 +166,10 @@ fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 
-# ---------- staging ----------
 staging=$(mktemp -d) || fail "could not create a staging directory (mktemp)."
 cleanup() { rm -rf -- "$staging"; }
 trap cleanup EXIT INT TERM
 
-# ---------- resolve version + download ----------
 if [ -n "$exe_override" ]; then
   # Dev/repo mode: install an already-built binary; skip download entirely.
   exe=$exe_override
@@ -221,7 +197,13 @@ else
   info "installing version ${resolved_version} from ${REPO} Releases"
   fetch "$tarball_url" "$staging/$tarball_name" || fail "could not download $tarball_name after retries."
   fetch "$sums_url" "$staging/SHA256SUMS" || fail "could not download SHA256SUMS after retries."
-  ( cd "$staging" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ) || fail "checksum verification FAILED for the downloaded artifacts. Nothing was installed. This may indicate a corrupted download or a tampered artifact — do not retry blindly; report it."
+  manifest_hash=$(awk -v wanted="$tarball_name" '$2 == wanted { count++; hash = $1; if (NF != 2) bad = 1 } END { if (count != 1 || bad) exit 1; print hash }' "$staging/SHA256SUMS") || fail "release checksum manifest must contain exactly one entry for $tarball_name. Nothing was installed."
+  case "$manifest_hash" in
+    ''|*[!0-9a-fA-F]*) fail "release checksum entry is malformed. Nothing was installed." ;;
+  esac
+  [ "${#manifest_hash}" -eq 64 ] || fail "release checksum entry is malformed. Nothing was installed."
+  printf '%s  %s\n' "$manifest_hash" "$tarball_name" > "$staging/selected.sha256"
+  ( cd "$staging" && sha256sum -c selected.sha256 >/dev/null 2>&1 ) || fail "checksum verification FAILED for the downloaded artifact. Nothing was installed. This may indicate a corrupted download or a tampered artifact — do not retry blindly; report it."
   extract_dir="$staging/payload"
   mkdir -p "$extract_dir"
   tar -xzf "$staging/$tarball_name" -C "$extract_dir" || fail "tarball extraction failed (downloaded artifact is not a valid gzip tarball)."
@@ -230,7 +212,6 @@ else
   resolved_version_note="downloaded ${resolved_version}"
 fi
 
-# ---------- execute-before-install ----------
 chmod 755 -- "$exe"
 if ! "$exe" version >/dev/null 2>&1; then
   fail "candidate binary failed 'opencomms version' BEFORE install (staging: $exe). Nothing was installed; the artifact is defective."
@@ -240,16 +221,13 @@ if ! "$exe" doctor >/dev/null 2>&1; then
 fi
 info "candidate binary passed execute-before-install checks."
 
-# ---------- atomic install with rollback ----------
 bin_dir=${bin_dir_override:-${OPENCOMMS_INSTALL_DIR:-"$real_home/.local/bin"}}
 if [ "$(id -u)" = "0" ] && [ -z "$bin_dir_override" ] && [ -z "${OPENCOMMS_INSTALL_DIR:-}" ]; then
   info "root without an explicit bin dir: defaulting to ${real_home}/.local/bin (invoking user's home)."
 fi
 mkdir -p "$bin_dir" || fail "could not create $bin_dir"
 target="$bin_dir/opencomms"
-# Reviewer P3-A: staging names are PID-predictable and cp would write
-# through a PRE-PLANTED symlink. mktemp creates the file itself (O_EXCL),
-# so a planted name cannot exist beforehand; the path is unpredictable.
+# mktemp creates the staging file exclusively, preventing pre-planted symlink writes.
 new_file=$(mktemp "$bin_dir/.opencomms-new-XXXXXXXX") || fail "could not create the staging file in $bin_dir"
 rm -f -- "$new_file" || true
 if [ -f "$target" ]; then
@@ -302,7 +280,6 @@ if [ -n "$resolved_version" ] && [ "${OPENCOMMS_ALLOW_DOWNGRADE:-0}" != "1" ]; t
   fi
 fi
 
-# ---------- idempotent PATH handling ----------
 path_note=""
 if [ "$no_path_edit" -eq 0 ]; then
   case ":$PATH:" in
@@ -319,7 +296,6 @@ if [ "$no_path_edit" -eq 0 ]; then
   esac
 fi
 
-# ---------- optional systemd service (orthogonal; tarball/checkout mode) ----------
 if [ "$do_service" -eq 1 ]; then
   if [ -z "$project_dir_arg" ]; then
     fail "--project <dir> is required with --service (the unit anchors WorkingDirectory there)"
@@ -357,7 +333,6 @@ if [ "$do_service" -eq 1 ]; then
   printf 'Pre-login (headless) operation, optional: loginctl enable-linger %s\n' "${SUDO_USER:-$(id -un)}"
 fi
 
-# ---------- optional node daemon unit (M3; systemd >= 249 only) ----------
 if [ "$do_node_daemon" -eq 1 ]; then
   if [ -z "$project_dir_arg" ]; then
     fail "--project <dir> is required with --node-daemon (the unit anchors WorkingDirectory there)"
@@ -413,7 +388,6 @@ if [ "$do_node_daemon" -eq 1 ]; then
   printf 'Pre-login (headless) operation, optional: loginctl enable-linger %s\n' "${SUDO_USER:-$(id -un)}"
 fi
 
-# ---------- summary ----------
 info "installed: $target"
 if [ -n "$resolved_version" ]; then
   info "$resolved_version"

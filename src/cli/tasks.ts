@@ -1,12 +1,7 @@
-/**
- * `opencomms task` + `opencomms members remove` + `opencomms session create`
- * (M4 CLI-parity verbs, Platform — docs/gui-cli-parity.md §3).
- *
- * Thin loopback HTTP clients over the Orchestrator API (contract v0.3 §3 +
- * the session engine operator routes) — never imports src/orchestrator/**
- * (contract §8 rule). Exit codes follow contract v0.2 §8: 0 ok · 1 generic ·
- * 2 validation · 3 conflict · 4 trust_denied · 5 unknown · 6 internal.
- */
+/** Loopback clients for task, member and session operations. */
+
+import { readFileSync } from "node:fs"
+import { randomUUID } from "node:crypto"
 
 export interface TaskCliResult {
   code: number
@@ -42,36 +37,6 @@ interface ApiResponse {
 
 const BASE = `http://127.0.0.1:${process.env["OPENCOMMS_ORCH_API_PORT"] ?? 4919}`
 
-async function callApi(
-  path: string,
-  init?: { method?: string; body?: unknown },
-): Promise<{ status: number; payload: ApiResponse }> {
-  let response: globalThis.Response
-  try {
-    response = await fetch(`${BASE}${path}`, {
-      method: init?.method ?? "GET",
-      headers: { "content-type": "application/json" },
-      body: init?.body === undefined ? undefined : JSON.stringify(init.body),
-      signal: AbortSignal.timeout(30_000),
-    })
-  } catch (error) {
-    return {
-      status: 0,
-      payload: {
-        ok: false,
-        message: `cannot reach the OpenComms console at ${BASE} (${(error as Error).message}). Is \`opencomms gui --server\` running?`,
-      },
-    }
-  }
-  let payload: ApiResponse
-  try {
-    payload = (await response.json()) as ApiResponse
-  } catch {
-    payload = { ok: false, message: `console returned non-JSON (HTTP ${response.status})` }
-  }
-  return { status: response.status, payload }
-}
-
 export interface TaskDeps {
   fetch?: typeof globalThis.fetch
   base?: string
@@ -79,13 +44,8 @@ export interface TaskDeps {
 
 let injectedDeps: TaskDeps | null = null
 
-/** Test hook: inject fetch/base before calling the task verbs. */
 export function setTaskDeps(deps: TaskDeps | null): void {
   injectedDeps = deps
-}
-
-function effectiveBase(): string {
-  return injectedDeps?.base ?? BASE
 }
 
 async function fetchJson(
@@ -119,7 +79,6 @@ async function fetchJson(
   }
 }
 
-/** `opencomms task list` — wraps GET /api/orchestrator/tasks. */
 export async function taskList(argv: string[]): Promise<TaskCliResult> {
   const asJson = argv.includes("--json")
   const { status, payload } = await fetchJson("/api/orchestrator/tasks")
@@ -132,12 +91,11 @@ export async function taskList(argv: string[]): Promise<TaskCliResult> {
   if (tasks.length === 0) return ok("No tasks.")
   const lines = tasks.map(
     (t) =>
-      `${String(t["id"])} ${String(t["title"])} | agent=${String(t["agent_id"])} | ${String(t["status"])}${t["channel"] ? ` | channel=${String(t["channel"])}` : ""}`,
+      `${String(t["task_id"])} ${String(t["title"])} | owner=${String(t["owner"] ?? t["agent_id"])} | execution=${String(t["execution_state"] ?? "unknown")} | delivery=${String(t["delivery_state"] ?? t["status"])}${t["blocker"] ? ` | blocker=${String(t["blocker"])}` : ""}${t["channel"] ? ` | channel=${String(t["channel"])}` : ""}`,
   )
   return ok(lines.join("\n"))
 }
 
-/** `opencomms task assign` — wraps POST /api/orchestrator/tasks/assign. */
 export async function taskAssign(argv: string[]): Promise<TaskCliResult> {
   const agentId = flagValue(argv, "--agent")
   const title = flagValue(argv, "--title")
@@ -155,20 +113,144 @@ export async function taskAssign(argv: string[]): Promise<TaskCliResult> {
     )
   }
   const asJson = argv.includes("--json")
+  const requestId = flagValue(argv, "--request-id") ?? randomUUID()
+  const repeated = (flag: string): string[] =>
+    argv.flatMap((token, i) => (token === flag && argv[i + 1] ? [argv[i + 1]!] : []))
   const { status, payload } = await fetchJson("/api/orchestrator/tasks/assign", {
     method: "POST",
-    body: { agent_id: agentId, task: { title, body, channel } },
+    body: {
+      agent_id: agentId,
+      request_id: requestId,
+      task: {
+        title,
+        body,
+        channel,
+        scope: flagValue(argv, "--scope"),
+        acceptance_criteria: repeated("--criterion"),
+        dependencies: repeated("--dependency"),
+        ownership: repeated("--owns"),
+      },
+    },
   })
   if (asJson)
-    return { code: status === 200 && payload.ok ? 0 : exitCodeForStatus(status), output: JSON.stringify(payload) }
-  if (!payload.ok) return fail(exitCodeForStatus(status), payload.message ?? `task assign failed (HTTP ${status})`)
-  return ok(String(payload.message ?? `Task assigned to ${agentId}.`))
+    return {
+      code: status === 200 && payload.ok ? 0 : exitCodeForStatus(status),
+      output: JSON.stringify({ ...payload, request_id: requestId }),
+    }
+  if (!payload.ok)
+    return fail(
+      exitCodeForStatus(status),
+      `${payload.message ?? `task assign failed (HTTP ${status})`}\nrequest_id=${requestId}`,
+    )
+  return ok(`${payload.message ?? `Task assigned to ${agentId}.`}\nrequest_id=${requestId}`)
 }
 
-/**
- * `opencomms members remove <channel> <session_id>` — wraps the existing
- * operator remove route (POST /api/sessions/{name}/members/remove).
- */
+export async function taskShow(argv: string[]): Promise<TaskCliResult> {
+  const id = flagValue(argv, "--id") ?? argv.find((t) => t.startsWith("tsk_"))
+  if (!id) return fail(2, "Usage: opencomms task show <task_id> [--json]")
+  const { status, payload } = await fetchJson(`/api/orchestrator/tasks/${encodeURIComponent(id)}`)
+  return {
+    code: payload.ok && status === 200 ? 0 : exitCodeForStatus(status),
+    output: JSON.stringify(payload, null, argv.includes("--json") ? undefined : 2),
+  }
+}
+
+/** Human operator transition; evidence/review JSON files avoid shell quoting. */
+export async function taskTransition(argv: string[]): Promise<TaskCliResult> {
+  const id = flagValue(argv, "--id") ?? argv.find((t) => t.startsWith("tsk_"))
+  const state = flagValue(argv, "--state")
+  const revision = Number(flagValue(argv, "--revision"))
+  if (!id || !state || !Number.isInteger(revision) || revision < 1)
+    return fail(
+      2,
+      "Usage: opencomms task transition <task_id> --state <state> --revision <n> [--blocker <reason>] [--evidence-file <json>] [--review-file <json>] [--json]",
+    )
+  const body: Record<string, unknown> = {
+    state,
+    expected_revision: revision,
+    actor_id: "operator",
+    blocker: flagValue(argv, "--blocker"),
+  }
+  try {
+    for (const [flag, key] of [
+      ["--evidence-file", "evidence"],
+      ["--review-file", "review"],
+      ["--criteria-file", "acceptance_criteria"],
+      ["--artifacts-file", "artifacts"],
+    ]) {
+      const file = flagValue(argv, flag!)
+      if (file) body[key!] = JSON.parse(readFileSync(file, "utf8"))
+    }
+  } catch (error) {
+    return fail(2, `Cannot read transition JSON: ${(error as Error).message}`)
+  }
+  const { status, payload } = await fetchJson(`/api/orchestrator/tasks/${encodeURIComponent(id)}/transition`, {
+    method: "POST",
+    body,
+  })
+  return {
+    code: payload.ok && status === 200 ? 0 : exitCodeForStatus(status),
+    output: argv.includes("--json")
+      ? JSON.stringify(payload)
+      : (payload.message ?? `Transition failed (HTTP ${status})`),
+  }
+}
+
+export async function taskReassign(argv: string[]): Promise<TaskCliResult> {
+  const id = flagValue(argv, "--id") ?? argv.find((t) => t.startsWith("tsk_"))
+  const agent = flagValue(argv, "--agent"),
+    reason = flagValue(argv, "--reason")
+  const revision = Number(flagValue(argv, "--revision"))
+  if (!id || !agent || !reason || !Number.isInteger(revision) || revision < 1)
+    return fail(
+      2,
+      "Usage: opencomms task reassign <task_id> --agent <id> --reason <context> --revision <n> [--channel <existing>] [--handoff-confirmed] [--allow-ownership-conflict] [--request-id <id>] [--json]",
+    )
+  const requestId = flagValue(argv, "--request-id") ?? randomUUID()
+  const { status, payload } = await fetchJson(`/api/orchestrator/tasks/${encodeURIComponent(id)}/reassign`, {
+    method: "POST",
+    body: {
+      actor_id: "operator",
+      agent_id: agent,
+      expected_revision: revision,
+      request_id: requestId,
+      reason,
+      channel: flagValue(argv, "--channel"),
+      handoff_confirmed: argv.includes("--handoff-confirmed"),
+      allow_ownership_conflict: argv.includes("--allow-ownership-conflict"),
+    },
+  })
+  return {
+    code: payload.ok && status === 200 ? 0 : exitCodeForStatus(status),
+    output: argv.includes("--json")
+      ? JSON.stringify({ ...payload, request_id: requestId })
+      : `${payload.message ?? `Handoff failed (HTTP ${status})`}\nrequest_id=${requestId}`,
+  }
+}
+
+export async function taskContext(argv: string[]): Promise<TaskCliResult> {
+  const sub = argv[0] ?? "list"
+  let path = "/api/orchestrator/context"
+  let init: { method?: string; body?: unknown } | undefined
+  if (sub === "handoff") path += "/handoff"
+  else if (sub === "list") path += `?query=${encodeURIComponent(flagValue(argv, "--search") ?? "")}`
+  else if (sub === "add") {
+    const file = flagValue(argv, "--record-file")
+    if (!file) return fail(2, "Usage: opencomms task context add --record-file <context.json>")
+    try {
+      init = { method: "POST", body: JSON.parse(readFileSync(file, "utf8")) }
+    } catch (error) {
+      return fail(2, `Cannot read context JSON: ${(error as Error).message}`)
+    }
+  } else
+    return fail(2, "Usage: opencomms task context <list|add|handoff> [--search <text>] [--record-file <json>] [--json]")
+  const { status, payload } = await fetchJson(path, init)
+  return {
+    code: payload.ok && status === 200 ? 0 : exitCodeForStatus(status),
+    output: JSON.stringify(payload, null, argv.includes("--json") ? undefined : 2),
+  }
+}
+
 export async function membersRemove(argv: string[]): Promise<TaskCliResult> {
   const positional = argv.filter((t) => !t.startsWith("--"))
   const channel = positional[0]
@@ -187,13 +269,7 @@ export async function membersRemove(argv: string[]): Promise<TaskCliResult> {
   return ok(String(payload.message ?? `Member ${sessionId} removed from ${channel}.`))
 }
 
-/**
- * `opencomms session create` — HONEST PARTIAL (gui-cli-parity.md §3, Lead
- * decision M4): there is NO loopback HTTP route for channel creation in
- * src/gui/server.ts (the engine's create flow is engine-function-only),
- * so this verb intentionally returns the honest "API-only" answer instead
- * of inventing a route. If Backend adds /api/channels, wire it here.
- */
+/** Channel creation has no loopback route; report the API-only limitation explicitly. */
 export async function sessionCreate(argv: string[]): Promise<TaskCliResult> {
   const name = flagValue(argv, "--channel") ?? flagValue(argv, "--name")
   const as = flagValue(argv, "--as")

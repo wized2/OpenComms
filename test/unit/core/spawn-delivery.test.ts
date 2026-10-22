@@ -1,11 +1,4 @@
-/**
- * Spawn-push delivery tests.
- *
- * Covers the argv contract for the documented CLI resume APIs (argv array,
- * message as the LAST element, NO shell), the fail-closed gating (mode,
- * binding, host support), and the two-phase delivery flow with a fake
- * spawner: drain → spawn → commit; failure → FIFO requeue.
- */
+/** Injected processes verify argv-only resume, acceptance commits and FIFO retry. */
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
@@ -20,6 +13,7 @@ import {
   spawnArgvBudget,
   SPAWN_ARGV_BUDGET,
   isWindowsShimPath,
+  defaultSpawn,
   type SpawnCommand,
   type SpawnRunnerDeps,
 } from "../../../src/hosts/spawn-delivery.js"
@@ -150,7 +144,6 @@ test("deliverViaSpawn failure: CLI error requeues in FIFO order + records error"
 
   assert.equal(outcome.status, "failed")
   assert.equal(spawned.length, 1)
-  // FIFO restored: both messages pending again, original order.
   assert.deepEqual(
     (state.queues["sess_spawn_target"] ?? []).map((id) => state.messages[id]!.content),
     ["m1", "m2"],
@@ -188,6 +181,55 @@ test("deliverViaSpawn: per-member in-flight guard prevents overlapping spawns", 
   assert.equal(outcome.status, "delivered")
 })
 
+test("spawn delivery reserves the recipient before asynchronous drain and leaves concurrent new mail queued", async () => {
+  const state = emptyState()
+  const member = makeMember()
+  seedChannelWithSpawnMember(state, member)
+  sendMessage(state, { channel: "spawn-ch", content: "first assignment" }, "sess_sender")
+  const { deps } = makeFakeDeps(state)
+  let release: (() => void) | undefined
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let spawns = 0
+  deps.spawn = async () => {
+    spawns++
+    await gate
+    return { ok: true, stdout: "ok" }
+  }
+  const first = deliverViaSpawn(deps, member)
+  while (spawns === 0) await new Promise((resolve) => setTimeout(resolve, 5))
+  sendMessage(state, { channel: "spawn-ch", content: "second assignment" }, "sess_sender")
+  const concurrent = await deliverViaSpawn(deps, member)
+  assert.equal(concurrent.status, "skipped")
+  assert.equal(spawns, 1)
+  assert.deepEqual(
+    state.queues[member.session_id]?.map((id) => state.messages[id]?.content),
+    ["second assignment"],
+  )
+  release!()
+  assert.equal((await first).status, "delivered")
+})
+
+test("actual failed CLI process does not expose its peer argv or stdout/stderr in recorded errors", async () => {
+  const peerSecret = "sensitive-peer-content"
+  const hostSecret = "sensitive-host-diagnostic"
+  const result = await defaultSpawn(
+    {
+      command: process.execPath,
+      args: ["-e", `process.stdout.write('${hostSecret}');process.stderr.write('${hostSecret}');process.exit(17)`],
+      cwd: process.cwd(),
+    },
+    peerSecret,
+  )
+  assert.equal(result.ok, false)
+  if (!result.ok) {
+    assert.match(result.error, /code 17/)
+    assert.ok(!result.error.includes(peerSecret))
+    assert.ok(!result.error.includes(hostSecret))
+  }
+})
+
 test("codex member spawn uses codex exec resume argv", async () => {
   const state = emptyState()
   const member = makeMember({ host: "codex", host_session_id: "codex-session-9" })
@@ -203,8 +245,6 @@ test("codex member spawn uses codex exec resume argv", async () => {
 })
 
 test("join with spawn_push flag records spawn_push delivery mode (MCP schema)", async () => {
-  // Schema-level check: the tool schema exposes spawn_push and the mode
-  // round-trips through the engine. (Full MCP flow covered in mcp tests.)
   const state = emptyState()
   const created = createChannel(state, {
     channel: "spx",
@@ -230,8 +270,6 @@ test("join with spawn_push flag records spawn_push delivery mode (MCP schema)", 
   assert.equal(joined.ok, true)
   assert.equal(state.channels["spx"]!.members[1]!.delivery_mode, "spawn_push")
 })
-
-// ── P2-1: Windows npm-shim handling (command-template override) ──
 
 test("parseCommandTemplate: quote-aware split, no shell semantics", () => {
   assert.deepEqual(parseCommandTemplate("node C:\\tools\\cli.js"), ["node", "C:\\tools\\cli.js"])
@@ -295,92 +333,101 @@ test("P2-1: spawn failure with EINVAL carries the actionable shim hint", async (
   assert.equal(outcome.status, "failed")
   assert.match(outcome.detail, /EINVAL/)
   assert.match(outcome.detail, /OPENCOMMS_CODEX_BIN/)
-  // The failure is persisted in state.errors (visible via opencomms_status).
   assert.ok(
     (state.errors ?? []).some((e) => e.message.includes("Spawn delivery") && e.message.includes("EINVAL")),
     "persisted error recorded",
   )
   assert.equal(errors.length, 0, "driver delegates persistence to state.errors for spawn failures")
-  // FIFO preserved after the failed spawn.
   assert.equal((state.queues[member.session_id] ?? []).length, 1)
 })
 
-// ── P2-2: argv size guard ──
+// ── P2-2: argv size guard (partial FIFO drain) ──
 
 test("P2-2: head message alone oversized refused; queue untouched; no spawn", async () => {
   const state = emptyState()
   const member = makeMember()
   seedChannelWithSpawnMember(state, member)
-  // Force a tiny budget so a normal-sized message is head-oversized on any platform.
-  const key = process.platform === "win32" ? "win32" : "default"
-  const prev = SPAWN_ARGV_BUDGET[key]
-  SPAWN_ARGV_BUDGET[key] = 500
-  try {
-    const sent = sendMessage(state, { channel: "spawn-ch", content: "x".repeat(2_000) }, "sess_sender")
-    assert.equal(sent.ok, true)
-    const { deps, spawned, errors } = makeFakeDeps(state)
+  // Max content is 100_000 chars; still oversized once framed on both platforms.
+  const huge = "x".repeat(99_000)
+  const sent = sendMessage(state, { channel: "spawn-ch", content: huge }, "sess_sender")
+  assert.equal(sent.ok, true)
+  const headId = (sent.data as { message_ids: string[] }).message_ids[0]!
+  const { deps, spawned, errors } = makeFakeDeps(state)
 
-    const outcome = await deliverViaSpawn(deps, member)
-    assert.equal(outcome.status, "skipped")
-    assert.match(outcome.detail, /argv limit/)
-    assert.equal(spawned.length, 0, "no doomed spawn attempted")
-    assert.equal((state.queues[member.session_id] ?? []).length, 1, "queue left untouched")
-    for (const m of Object.values(state.messages)) assert.equal(m.delivery_status, "pending", "not drained")
-    assert.ok(errors.some((e) => e.includes("spawn argv limit") && e.includes("switch this member to pull")))
+  const outcome = await deliverViaSpawn(deps, member)
+  assert.equal(outcome.status, "skipped")
+  assert.match(outcome.detail, /argv limit/)
+  assert.equal(spawned.length, 0, "no doomed spawn attempted")
+  assert.equal((state.queues[member.session_id] ?? []).length, 1, "queue left untouched")
+  assert.equal(state.messages[headId]!.delivery_status, "pending")
+  assert.ok(errors.some((e) => e.includes("spawn argv limit")))
 
-    // Repeat attempt: no duplicate error spam (guard dedups per message id).
-    const outcome2 = await deliverViaSpawn(deps, member)
-    assert.equal(outcome2.status, "skipped")
-    assert.equal(errors.filter((e) => e.includes("spawn argv limit")).length, 1)
-  } finally {
-    SPAWN_ARGV_BUDGET[key] = prev!
-  }
+  const outcome2 = await deliverViaSpawn(deps, member)
+  assert.equal(outcome2.status, "skipped")
+  assert.equal(errors.filter((e) => e.includes("spawn argv limit")).length, 1, "error deduped")
 })
 
-test("P2-2b-strict: smaller later message does not leapfrog a blocked head", async () => {
-  // 80k head exceeds budget after fixed overhead on win32 (30k) and nearly fills
-  // linux 120k with framing; 50k is still too large to follow an 80k head;
-  // 5k must remain queued behind both — never delivered alone.
+test("P2-2 boundary: first-message JOIN_SEP must not be charged (UTF-8)", async () => {
   if (process.platform === "win32") return
-
   const state = emptyState()
   const member = makeMember()
   seedChannelWithSpawnMember(state, member)
-  const sizes = [80_000, 50_000, 5_000]
-  for (let i = 0; i < sizes.length; i++) {
-    const sent = sendMessage(state, { channel: "spawn-ch", content: `m${i} ` + "x".repeat(sizes[i]!) }, "sess_sender")
-    assert.equal(sent.ok, true)
-  }
-  const { deps, spawned, errors } = makeFakeDeps(state)
+  const content = "é".repeat(59_723) + "x"
+  const sent = sendMessage(state, { channel: "spawn-ch", content }, "sess_sender")
+  assert.equal(sent.ok, true)
+  const { deps, spawned } = makeFakeDeps(state)
   const outcome = await deliverViaSpawn(deps, member)
-  // Head alone may or may not fit; either way the 5k message must not spawn alone.
-  const pending = Object.values(state.messages).filter((m) => m.delivery_status === "pending")
+  assert.notEqual(outcome.detail, "no pending messages")
   if (outcome.status === "delivered") {
-    // Only a prefix from the front is allowed.
-    assert.ok(spawned.length === 1)
-    assert.ok(pending.length >= 1)
-    // The 5k message (last) must still be pending if 50k was not delivered first.
-    const lastId = (state.queues[member.session_id] ?? []).at(-1)
-    assert.ok(lastId)
+    assert.equal(spawned.length, 1)
   } else {
-    assert.equal(spawned.length, 0)
-    assert.equal(pending.length, 3)
+    assert.equal(outcome.status, "skipped")
+    assert.match(outcome.detail, /argv limit/)
+    assert.equal((state.queues[member.session_id] ?? []).length, 1)
   }
-  assert.equal(errors.filter((e) => e.includes("spawn argv limit")).length, 0)
+})
+
+test("P2-2b-strict: only the first fitting message drains; later ids stay queued in order", async () => {
+  if (process.platform === "win32") return
+  const state = emptyState()
+  const member = makeMember()
+  seedChannelWithSpawnMember(state, member)
+  // ~55k / ~55k / ~5k — only first fits under ~120k framed budget.
+  const sizes = [55_000, 55_000, 5_000]
+  const ids: string[] = []
+  for (let i = 0; i < sizes.length; i++) {
+    const sent = sendMessage(
+      state,
+      { channel: "spawn-ch", content: `m${i}:` + "x".repeat(sizes[i]!) },
+      "sess_sender",
+    )
+    assert.equal(sent.ok, true)
+    ids.push((sent.data as { message_ids: string[] }).message_ids[0]!)
+  }
+  const { deps, spawned } = makeFakeDeps(state)
+  const outcome = await deliverViaSpawn(deps, member)
+  assert.equal(outcome.status, "delivered")
+  assert.equal(spawned.length, 1)
+  const payload = spawned[0]!.message
+  assert.match(payload, /m0:/)
+  assert.doesNotMatch(payload, /m1:/)
+  assert.doesNotMatch(payload, /m2:/)
+  assert.deepEqual(state.queues[member.session_id], [ids[1], ids[2]])
+  assert.equal(state.messages[ids[0]!]!.delivery_status, "delivered")
+  assert.equal(state.messages[ids[1]!]!.delivery_status, "pending")
+  assert.equal(state.messages[ids[2]!]!.delivery_status, "pending")
 })
 
 test("P2-2b: FIFO partial drain when batch exceeds budget (issue #3)", async () => {
-  // Force POSIX-sized budget path: three ~45k messages → first two fit under
-  // 120k, third stays pending. On win32 (30k) the head alone is oversized;
-  // skip the partial-drain assertion on that platform.
   if (process.platform === "win32") return
-
   const state = emptyState()
   const member = makeMember()
   seedChannelWithSpawnMember(state, member)
+  const ids: string[] = []
   for (let i = 0; i < 3; i++) {
     const sent = sendMessage(state, { channel: "spawn-ch", content: `m${i} ` + "x".repeat(45_000) }, "sess_sender")
     assert.equal(sent.ok, true)
+    ids.push((sent.data as { message_ids: string[] }).message_ids[0]!)
   }
   const { deps, spawned, errors } = makeFakeDeps(state)
 
@@ -388,6 +435,7 @@ test("P2-2b: FIFO partial drain when batch exceeds budget (issue #3)", async () 
   assert.equal(outcome.status, "delivered", "first fitting prefix should deliver")
   assert.equal(spawned.length, 1, "one spawn with the fitting prefix")
   assert.equal((state.queues[member.session_id] ?? []).length, 1, "third message remains queued")
+  assert.deepEqual(state.queues[member.session_id], [ids[2]])
   const pending = Object.values(state.messages).filter((m) => m.delivery_status === "pending")
   assert.equal(pending.length, 1, "exactly one message still pending")
   assert.equal(errors.filter((e) => e.includes("spawn argv limit")).length, 0, "deferred messages are not errors")

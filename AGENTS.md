@@ -4,12 +4,12 @@
 
 ## 1. What OpenComms Is
 
-Project-local TypeScript OpenCode plugin that **links existing root OpenCode sessions** (2..N) into a communication channel with an **open role vocabulary** (e.g. Builder <-> Reviewer, or Lead/Coder/Tester trios) **without creating or owning sessions**.
+Project-local TypeScript coordination platform. Its linked OpenCode plugin **links existing root OpenCode sessions** (2..N) into a communication channel with an **open role vocabulary** without creating or owning those sessions. Separately authorized managed mode creates supported OpenCode or configured ACP sessions; see `docs/CAPABILITIES.md` for current limits.
 
-- Package: `opencomms` v1.1.0, ESM, `opencode >=1.18.0`
+- Package: `opencomms` v1.5.0, ESM, `opencode >=1.18.0`
 - Core sources: `src/core/types.ts`, `src/core/store.ts`, `src/core/engine.ts` + OpenCode adapter `src/plugin.ts`
 - State lives at `<project>/.opencomms/state.json` (schema v2), written atomically (temp file + rename). Legacy `.opencode-comms/state.json` exists only until the one-time v1->v2 migration
-- No new sessions ever created. Only links sessions the user already opened.
+- Linked mode never creates or replaces host sessions. Separately authorized managed mode can create OpenCode or configured ACP sessions; see `docs/CAPABILITIES.md` and `docs/TASK_EXECUTION.md` for current boundaries.
 
 ## 2. File Map (read only what you need)
 
@@ -41,7 +41,7 @@ Send message (queued) ---> Drain on peer idle (event hook)  [engine.ts sendMessa
 ```
 
 **Key invariants (never violate):**
-1. Never create/delete OpenCode sessions â€” only link existing ones (invariant; see ARCHITECTURE.md).
+1. Linked mode never creates/deletes/replaces host sessions. Managed creation/control requires explicit authorization through a supported runtime; preserve exact identity on resume and require explicit approval for replacement.
 2. Channel name is case-insensitive, normalized via `normalizeChannelName` (`src/core/engine.ts`), max 64 chars.
 3. One session cannot hold two roles on same channel; one role cannot be held by two sessions (`src/core/engine.ts` joinChannel).
 4. Project + worktree must match across members (`src/core/engine.ts` joinChannel).
@@ -130,3 +130,16 @@ Tests in `test/unit/engine.test.ts` (timer + channel/queue tests), `store.test.t
 
 ---
 *For deeper detail, see `docs/README.md` navigation hub.*
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+When the user types `/graphify`, use the installed graphify skill or instructions before doing anything else.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- Dirty graphify-out/ files are expected after hooks or incremental updates; dirty graph files are not a reason to skip graphify. Only skip graphify if the task is about stale or incorrect graph output, or the user explicitly says not to use it.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).

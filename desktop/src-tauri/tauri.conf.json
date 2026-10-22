@@ -1,13 +1,15 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "OpenComms Tauri Desktop GUI",
-  "version": "1.2.0",
+  "version": "1.5.0",
   "identifier": "dev.opencomms.desktop",
   "build": {
     "frontendDist": "../dist-shell",
+    "beforeDevCommand": "node ../scripts/build-shell-asset.mjs",
     "beforeBuildCommand": "node ../scripts/build-shell-asset.mjs"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "OpenComms Tauri Desktop GUI",
@@ -21,7 +23,7 @@
         "script-src": "'self'",
         "style-src": "'self' 'unsafe-inline'",
         "img-src": "'self' data:",
-        "connect-src": "'self' ipc: http://ipc.localhost http://127.0.0.1:1455"
+        "connect-src": "'self' ipc: http://ipc.localhost"
       }
     }
   },
@@ -36,17 +38,6 @@
     "externalBin": [
       "binaries/opencomms-coordinator"
     ],
-    "createUpdaterArtifacts": true
-  },
-  "plugins": {
-    "updater": {
-      "endpoints": [
-        "https://github.com/CL-BAF/OpenComms/releases/latest/download/latest.json"
-      ],
-      "pubkey": "",
-      "windows": {
-        "installMode": "passive"
-      }
-    }
+    "createUpdaterArtifacts": false
   }
 }
