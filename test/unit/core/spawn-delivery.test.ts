@@ -11,13 +11,13 @@ import {
   parseCommandTemplate,
   resolveBinaryOverride,
   spawnArgvBudget,
-  SPAWN_ARGV_BUDGET,
+  spawnArgumentCost,
   isWindowsShimPath,
   defaultSpawn,
   type SpawnCommand,
   type SpawnRunnerDeps,
 } from "../../../src/hosts/spawn-delivery.js"
-import { createChannel, joinChannel, sendMessage } from "../../../src/core/engine.js"
+import { createChannel, joinChannel, sendMessage, formatUntrustedMessage } from "../../../src/core/engine.js"
 import { emptyState } from "../../../src/core/store.js"
 import type { Member, State } from "../../../src/core/types.js"
 
@@ -347,8 +347,9 @@ test("P2-2: head message alone oversized refused; queue untouched; no spawn", as
   const state = emptyState()
   const member = makeMember()
   seedChannelWithSpawnMember(state, member)
-  // Max content is 100_000 chars; still oversized once framed on both platforms.
-  const huge = "x".repeat(99_000)
+  // Max content is 100_000 chars. Multi-byte UTF-8 makes framed cost exceed the 120k POSIX budget.
+  // (99k ASCII still fits after framing on Linux — that fixture was incorrect.)
+  const huge = "\u00e9".repeat(100_000)
   const sent = sendMessage(state, { channel: "spawn-ch", content: huge }, "sess_sender")
   assert.equal(sent.ok, true)
   const headId = (sent.data as { message_ids: string[] }).message_ids[0]!
@@ -372,19 +373,31 @@ test("P2-2 boundary: first-message JOIN_SEP must not be charged (UTF-8)", async 
   const state = emptyState()
   const member = makeMember()
   seedChannelWithSpawnMember(state, member)
-  const content = "é".repeat(59_723) + "x"
-  const sent = sendMessage(state, { channel: "spawn-ch", content }, "sess_sender")
-  assert.equal(sent.ok, true)
+  const sent0 = sendMessage(state, { channel: "spawn-ch", content: "probe" }, "sess_sender")
+  assert.equal(sent0.ok, true)
+  const headId = (sent0.data as { message_ids: string[] }).message_ids[0]!
+  const msg = state.messages[headId]!
+  const cmd = CLAUDE_CODE_SPAWN.buildResumeCommand({
+    hostSessionId: member.host_session_id as string,
+    cwd: "C:\\proj",
+  })
+  const fixedOverhead = [cmd.command, ...cmd.args].reduce((sum, arg) => sum + spawnArgumentCost(arg), 64)
+  const budget = spawnArgvBudget()
+  const emptyFramed = formatUntrustedMessage({ ...msg, content: "" }, "spawn-ch")
+  const wrapperCost = spawnArgumentCost(emptyFramed)
+  const room = budget - fixedOverhead - wrapperCost - 200
+  assert.ok(room > 1000, "expected room for a fitting payload under the platform budget")
+  const content = "x".repeat(Math.min(room, 100_000))
+  msg.content = content
+  const headCost = fixedOverhead + spawnArgumentCost(formatUntrustedMessage(msg, "spawn-ch"))
+  assert.ok(headCost <= budget, `expected fitting headCost=${headCost} budget=${budget}`)
   const { deps, spawned } = makeFakeDeps(state)
   const outcome = await deliverViaSpawn(deps, member)
-  assert.notEqual(outcome.detail, "no pending messages")
-  if (outcome.status === "delivered") {
-    assert.equal(spawned.length, 1)
-  } else {
-    assert.equal(outcome.status, "skipped")
-    assert.match(outcome.detail, /argv limit/)
-    assert.equal((state.queues[member.session_id] ?? []).length, 1)
-  }
+  assert.equal(outcome.status, "delivered", outcome.detail)
+  assert.equal(spawned.length, 1)
+  assert.ok(String(spawned[0]?.message ?? "").includes(content.slice(0, 32)))
+  assert.equal((state.queues[member.session_id] ?? []).length, 0)
+  assert.equal(state.messages[headId]!.delivery_status, "delivered")
 })
 
 test("P2-2b-strict: only the first fitting message drains; later ids stay queued in order", async () => {
@@ -392,8 +405,9 @@ test("P2-2b-strict: only the first fitting message drains; later ids stay queued
   const state = emptyState()
   const member = makeMember()
   seedChannelWithSpawnMember(state, member)
-  // ~55k / ~55k / ~5k — only first fits under ~120k framed budget.
-  const sizes = [55_000, 55_000, 5_000]
+  // 80k / 50k / 5k — only the first fits under the ~120k POSIX framed budget.
+  // A smaller third message must not leapfrog the blocked 50k second message.
+  const sizes = [80_000, 50_000, 5_000]
   const ids: string[] = []
   for (let i = 0; i < sizes.length; i++) {
     const sent = sendMessage(
@@ -406,17 +420,18 @@ test("P2-2b-strict: only the first fitting message drains; later ids stay queued
   }
   const { deps, spawned } = makeFakeDeps(state)
   const outcome = await deliverViaSpawn(deps, member)
-  assert.equal(outcome.status, "delivered")
-  assert.equal(spawned.length, 1)
-  const payload = spawned[0]!.message
-  assert.match(payload, /m0:/)
-  assert.doesNotMatch(payload, /m1:/)
-  assert.doesNotMatch(payload, /m2:/)
-  assert.deepEqual(state.queues[member.session_id], [ids[1], ids[2]])
+  assert.equal(outcome.status, "delivered", outcome.detail)
+  assert.equal(spawned.length, 1, "one spawn with only the first message")
+  const payload = String(spawned[0]?.message ?? "")
+  assert.ok(payload.includes("m0:"), "first message content present")
+  assert.equal(payload.includes("m1:"), false, "second message must not appear in spawn payload")
+  assert.equal(payload.includes("m2:"), false, "third message must not appear in spawn payload")
+  assert.deepEqual(state.queues[member.session_id], [ids[1], ids[2]], "remaining queue is exact second then third")
   assert.equal(state.messages[ids[0]!]!.delivery_status, "delivered")
   assert.equal(state.messages[ids[1]!]!.delivery_status, "pending")
   assert.equal(state.messages[ids[2]!]!.delivery_status, "pending")
 })
+
 
 test("P2-2b: FIFO partial drain when batch exceeds budget (issue #3)", async () => {
   if (process.platform === "win32") return

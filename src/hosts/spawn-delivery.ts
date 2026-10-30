@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Resume delivery uses argv-only child processes and persisted two-phase queues.
  * The host exposes no busy-check API; concurrent TUI turns may interleave.
  * Codex TUI-session resume remains unverified. Hosts without a verified native
@@ -9,13 +9,14 @@ import { execFile } from "node:child_process"
 import { existsSync } from "node:fs"
 import type { Member, State } from "../core/types.js"
 import {
+  budgetRefusal,
   commitDelivery,
   drainForDelivery,
   effectiveEndpointCapabilities,
   formatUntrustedMessage,
-  type MessageEnvelope,
   requeueFailedDelivery,
 } from "../core/engine.js"
+import type { MessageEnvelope } from "../core/types.js"
 
 export interface SpawnCommand {
   /** Executable to spawn (resolved or bare name â€” resolved on PATH). */
@@ -339,12 +340,20 @@ async function deliverViaSpawnInner(deps: SpawnRunnerDeps, member: Member): Prom
       const cmd = builder.buildResumeCommand({ hostSessionId: member.host_session_id as string, cwd: deps.cwd })
       const fixedOverhead = [cmd.command, ...cmd.args].reduce((sum, arg) => sum + spawnArgumentCost(arg), 64)
 
-      // Head-only oversized refusal (consistent accounting: no JOIN on first msg).
+      // First *eligible* message oversized? Refuse without draining.
+      // Channel eligibility (paused / budget) is checked before argv size so an
+      // oversized ineligible head cannot block other channels' mail.
+      // Accounting matches canDeliver: no JOIN cost on the first framed message.
+      const now = Date.now()
       for (const id of state.queues[member.session_id] ?? []) {
         const msg = state.messages[id]
         if (!msg || msg.delivery_status !== "pending") continue
-        const channelName =
-          Object.values(state.channels).find((channel) => channel.id === msg.channel_id)?.name ?? msg.channel_id
+        if (msg.recipient_session_id !== member.session_id) continue
+        const channel = Object.values(state.channels).find((c) => c.id === msg.channel_id)
+        if (!channel) continue
+        if (channel.paused) continue
+        if (budgetRefusal(channel, now)) continue
+        const channelName = channel.name
         const headCost = fixedOverhead + spawnArgumentCost(formatUntrustedMessage(msg, channelName))
         if (headCost > budget) headOversizedId = id
         break

@@ -367,7 +367,7 @@ function clampOptionalPositive(value: number | undefined | null, min: number, ma
 }
 
 /** Conversation budget guard shared by sends and every handover attempt. */
-function budgetRefusal(channel: Channel, now: number): string | null {
+export function budgetRefusal(channel: Channel, now: number): string | null {
   const budgets = channel.budgets
   if (!budgets) return null
   if (budgets.max_runtime_ms !== null && now - channel.created_at > budgets.max_runtime_ms) {
