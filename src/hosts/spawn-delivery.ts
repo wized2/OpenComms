@@ -353,6 +353,16 @@ async function deliverViaSpawnInner(deps: SpawnRunnerDeps, member: Member): Prom
         if (!channel) continue
         if (channel.paused) continue
         if (budgetRefusal(channel, now)) continue
+        // Match drainQueue eligibility: stale window + recipient cooldown must not
+        // treat an ineligible oversized head as blocking the queue forever.
+        const recipient = channel.members.find((m) => m.session_id === member.session_id)
+        const staleMode = recipient?.stale_policy?.mode ?? "window"
+        if (staleMode === "window") {
+          const windowMs = recipient?.stale_policy?.window_ms ?? channel.stale_event_ms
+          if (now - msg.timestamp > windowMs) continue
+        }
+        const cooldownUntil = channel.cooldown_until[member.session_id] ?? 0
+        if (now < cooldownUntil) continue
         const channelName = channel.name
         const headCost = fixedOverhead + spawnArgumentCost(formatUntrustedMessage(msg, channelName))
         if (headCost > budget) headOversizedId = id
@@ -377,7 +387,7 @@ async function deliverViaSpawnInner(deps: SpawnRunnerDeps, member: Member): Prom
       const queueSnapshot = () =>
         JSON.stringify((state.queues[member.session_id] ?? []).map((id) => [id, state.messages[id]?.delivery_status]))
       const before = queueSnapshot()
-      const pairs = drainForDelivery(state, member.session_id, { canDeliver })
+      const pairs = drainForDelivery(state, member.session_id, { canDeliver, stopOnCanDeliverReject: true })
       framed = pairs
         .flatMap((pair) => {
           const msg = state.messages[pair.message_id]

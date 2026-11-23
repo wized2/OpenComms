@@ -385,12 +385,32 @@ test("P2-2 boundary: first-message JOIN_SEP must not be charged (UTF-8)", async 
   const budget = spawnArgvBudget()
   const emptyFramed = formatUntrustedMessage({ ...msg, content: "" }, "spawn-ch")
   const wrapperCost = spawnArgumentCost(emptyFramed)
-  const room = budget - fixedOverhead - wrapperCost - 200
-  assert.ok(room > 1000, "expected room for a fitting payload under the platform budget")
-  const content = "x".repeat(Math.min(room, 100_000))
-  msg.content = content
+  // Deterministic near-limit multibyte payload: charge framing with UTF-8 bytes.
+  // A bug that still charges JOIN_SEP on the first message would push this over budget.
+  const joinCost = spawnArgumentCost("\n\n---\n\n")
+  let lo = 1
+  let hi = 80_000
+  let best = "é"
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1
+    const candidate = "é".repeat(mid)
+    const cost = fixedOverhead + spawnArgumentCost(formatUntrustedMessage({ ...msg, content: candidate }, "spawn-ch"))
+    if (cost + joinCost > budget && cost <= budget) {
+      best = candidate
+      break
+    }
+    if (cost <= budget) {
+      best = candidate
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
+  }
+  msg.content = best
   const headCost = fixedOverhead + spawnArgumentCost(formatUntrustedMessage(msg, "spawn-ch"))
   assert.ok(headCost <= budget, `expected fitting headCost=${headCost} budget=${budget}`)
+  assert.ok(headCost + joinCost > budget, `boundary should exceed budget if JOIN were charged: head=${headCost} join=${joinCost} budget=${budget}`)
+  const content = best
   const { deps, spawned } = makeFakeDeps(state)
   const outcome = await deliverViaSpawn(deps, member)
   assert.equal(outcome.status, "delivered", outcome.detail)

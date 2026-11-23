@@ -1086,7 +1086,11 @@ export function pendingRecipients(state: State): string[] {
 export function drainForDelivery(
   state: State,
   recipientSessionId: string,
-  opts: { now?: number; canDeliver?: (msg: MessageEnvelope) => boolean } = {},
+  opts: {
+    now?: number
+    canDeliver?: (msg: MessageEnvelope) => boolean
+    stopOnCanDeliverReject?: boolean
+  } = {},
 ): DeliveryPair[] {
   const delivered = drainQueue(state, recipientSessionId, opts)
   return delivered.map((envelope) => ({
@@ -1211,7 +1215,13 @@ export function sweepInFlight(
 export function drainQueue(
   state: State,
   recipientSessionId: string,
-  opts: { now?: number; canDeliver?: (msg: MessageEnvelope) => boolean } = {},
+  opts: {
+    now?: number
+    canDeliver?: (msg: MessageEnvelope) => boolean
+    /** When true, stop the FIFO at the first canDeliver rejection (spawn argv).
+     * Default false: skip ineligible messages (managed/pull filters). */
+    stopOnCanDeliverReject?: boolean
+  } = {},
 ): MessageEnvelope[] {
   const now = opts.now ?? Date.now()
   const queue = state.queues[recipientSessionId] ?? []
@@ -1269,9 +1279,14 @@ export function drainQueue(
     // Do not skip a large message to deliver a later smaller one.
     if (opts.canDeliver && !opts.canDeliver(msg)) {
       remaining.push(id)
-      const idx = queue.indexOf(id)
-      for (const rest of queue.slice(idx + 1)) remaining.push(rest)
-      break
+      if (opts.stopOnCanDeliverReject) {
+        // Strict FIFO (spawn argv): do not leapfrog a larger head with a smaller later message.
+        const idx = queue.indexOf(id)
+        for (const rest of queue.slice(idx + 1)) remaining.push(rest)
+        break
+      }
+      // Eligibility filter (managed/pull): skip this message, keep draining.
+      continue
     }
 
     msg.delivery_status = "in_flight"
