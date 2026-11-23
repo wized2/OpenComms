@@ -64,3 +64,31 @@ test("runtime budget expiring after enqueue prevents host handover while retaini
   assert.equal(state.channels["bounded"]!.delivered_total, 0)
   assert.equal(state.queues["worker"]!.length, 3)
 })
+
+test("canDeliver skip filter drains later messages when stopOnCanDeliverReject is false", () => {
+  const { state, now } = queued({})
+  const queue = state.queues["worker"]!
+  assert.equal(queue.length, 3)
+  const skipFirst = queue[0]!
+  const drained = drainQueue(state, "worker", {
+    now,
+    canDeliver: (msg) => msg.message_id !== skipFirst,
+  })
+  assert.equal(drained.length, 2, "later eligible messages still drain")
+  assert.ok(drained.every((m) => m.message_id !== skipFirst))
+  assert.ok(state.queues["worker"]!.includes(skipFirst), "rejected head remains queued")
+})
+
+test("canDeliver with stopOnCanDeliverReject stops FIFO at first rejection", () => {
+  const { state, now } = queued({})
+  const queue = [...(state.queues["worker"] ?? [])]
+  assert.equal(queue.length, 3)
+  const skipFirst = queue[0]!
+  const drained = drainQueue(state, "worker", {
+    now,
+    canDeliver: (msg) => msg.message_id !== skipFirst,
+    stopOnCanDeliverReject: true,
+  })
+  assert.equal(drained.length, 0, "strict FIFO does not leapfrog rejected head")
+  assert.deepEqual(state.queues["worker"], queue, "full queue retained in order")
+})

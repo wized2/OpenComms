@@ -383,8 +383,6 @@ test("P2-2 boundary: first-message JOIN_SEP must not be charged (UTF-8)", async 
   })
   const fixedOverhead = [cmd.command, ...cmd.args].reduce((sum, arg) => sum + spawnArgumentCost(arg), 64)
   const budget = spawnArgvBudget()
-  const emptyFramed = formatUntrustedMessage({ ...msg, content: "" }, "spawn-ch")
-  const wrapperCost = spawnArgumentCost(emptyFramed)
   // Deterministic near-limit multibyte payload: charge framing with UTF-8 bytes.
   // A bug that still charges JOIN_SEP on the first message would push this over budget.
   const joinCost = spawnArgumentCost("\n\n---\n\n")
